@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Ni9Mo3HPt4O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.15192529
+_cell_length_b   5.15192529
+_cell_length_c   21.30979407
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Ni9Mo3HPt4O
+_chemical_formula_sum   'Ni9 Mo3 H1 Pt4 O1'
+_cell_volume   489.83407968
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Ni  Ni0  1  0.000000  0.000000  0.351951  1
+  Ni  Ni1  1  0.500000  0.000000  0.351951  1
+  Ni  Ni2  1  0.500000  0.500000  0.351951  1
+  Mo  Mo3  1  -0.000000  0.500000  0.351951  1
+  Ni  Ni4  1  0.666667  0.333333  0.450650  1
+  Ni  Ni5  1  0.166667  0.333333  0.450650  1
+  Ni  Ni6  1  0.166667  0.833333  0.450650  1
+  Mo  Mo7  1  0.666667  0.833333  0.450650  1
+  Ni  Ni8  1  0.330364  0.660315  0.546672  1
+  Ni  Ni9  1  0.829959  0.660322  0.546668  1
+  Ni  Ni10  1  0.831846  0.163702  0.545342  1
+  Mo  Mo11  1  0.336200  0.172419  0.557636  1
+  Pt  Pt12  1  -0.018180  -0.034371  0.655563  1
+  Pt  Pt13  1  0.483702  -0.034329  0.655571  1
+  Pt  Pt14  1  0.483324  0.466686  0.671582  1
+  Pt  Pt15  1  -0.016814  0.466580  0.654614  1
+  O  O16  1  0.508256  0.516545  0.768813  1
+  H  H17  1  0.613616  0.726906  0.781713  1

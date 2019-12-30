@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Mn3HIr9Pt4O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.40342839
+_cell_length_b   5.40342839
+_cell_length_c   21.61782121
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Mn3HIr9Pt4O
+_chemical_formula_sum   'Mn3 Ir9 H1 Pt4 O1'
+_cell_volume   546.61475856
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Ir  Ir0  1  0.000000  0.000000  0.346936  1
+  Ir  Ir1  1  0.500000  1.000000  0.346936  1
+  Ir  Ir2  1  0.500000  0.500000  0.346936  1
+  Mn  Mn3  1  0.000000  0.500000  0.346936  1
+  Ir  Ir4  1  0.666667  0.333333  0.448979  1
+  Ir  Ir5  1  0.166667  0.333333  0.448979  1
+  Ir  Ir6  1  0.166667  0.833333  0.448979  1
+  Mn  Mn7  1  0.666667  0.833333  0.448979  1
+  Ir  Ir8  1  0.337291  0.662443  0.547181  1
+  Ir  Ir9  1  0.825152  0.662443  0.547181  1
+  Ir  Ir10  1  0.830089  0.160179  0.545678  1
+  Mn  Mn11  1  0.333248  0.166497  0.548133  1
+  Pt  Pt12  1  0.004239  1.003693  0.652240  1
+  Pt  Pt13  1  0.499454  1.003693  0.652240  1
+  Pt  Pt14  1  0.501503  0.503006  0.657326  1
+  Pt  Pt15  1  0.000754  0.501507  0.655180  1
+  O  O16  1  0.480033  0.460066  0.751728  1
+  H  H17  1  0.576677  0.653353  0.769058  1

@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_HPt13Au3O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.67271648
+_cell_length_b   5.67271648
+_cell_length_c   21.94763042
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   HPt13Au3O
+_chemical_formula_sum   'H1 Pt13 Au3 O1'
+_cell_volume   611.64640481
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Pt  Pt0  1  0.000000  0.000000  0.341723  1
+  Pt  Pt1  1  0.500000  0.000000  0.341723  1
+  Pt  Pt2  1  0.500000  0.500000  0.341723  1
+  Au  Au3  1  0.000000  0.500000  0.341723  1
+  Pt  Pt4  1  0.666667  0.333333  0.447241  1
+  Pt  Pt5  1  0.166667  0.333333  0.447241  1
+  Pt  Pt6  1  0.166667  0.833333  0.447241  1
+  Au  Au7  1  0.666667  0.833333  0.447241  1
+  Pt  Pt8  1  0.333253  0.664767  0.553659  1
+  Pt  Pt9  1  0.831514  0.664767  0.553659  1
+  Pt  Pt10  1  0.834291  0.168581  0.552297  1
+  Au  Au11  1  0.334541  0.169083  0.553565  1
+  Pt  Pt12  1  0.995667  0.997486  0.657475  1
+  Pt  Pt13  1  0.501819  0.997486  0.657475  1
+  Pt  Pt14  1  0.502031  0.504061  0.663735  1
+  Pt  Pt15  1  1.000524  0.501048  0.658094  1
+  O  O16  1  0.477434  0.454869  0.754178  1
+  H  H17  1  0.568983  0.637966  0.771858  1

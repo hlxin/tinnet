@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_HIr3Pt4Au9O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.77015950
+_cell_length_b   5.77015950
+_cell_length_c   22.06697326
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   HIr3Pt4Au9O
+_chemical_formula_sum   'Ir3 H1 Pt4 Au9 O1'
+_cell_volume   636.28112089
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Au  Au0  1  0.000000  0.000000  0.339874  1
+  Au  Au1  1  0.500000  1.000000  0.339874  1
+  Au  Au2  1  0.500000  0.500000  0.339874  1
+  Ir  Ir3  1  -0.000000  0.500000  0.339874  1
+  Au  Au4  1  0.666667  0.333333  0.446625  1
+  Au  Au5  1  0.166667  0.333333  0.446625  1
+  Au  Au6  1  0.166667  0.833333  0.446625  1
+  Ir  Ir7  1  0.666667  0.833333  0.446625  1
+  Au  Au8  1  0.346525  0.685484  0.553741  1
+  Au  Au9  1  0.838959  0.685484  0.553741  1
+  Au  Au10  1  0.841598  0.183196  0.552552  1
+  Ir  Ir11  1  0.343553  0.187105  0.556611  1
+  Pt  Pt12  1  0.028293  1.041237  0.657406  1
+  Pt  Pt13  1  0.512944  1.041237  0.657406  1
+  Pt  Pt14  1  0.515693  0.531386  0.663778  1
+  Pt  Pt15  1  0.017871  0.535741  0.658496  1
+  O  O16  1  0.529662  0.559324  0.754586  1
+  H  H17  1  0.624432  0.748864  0.765881  1

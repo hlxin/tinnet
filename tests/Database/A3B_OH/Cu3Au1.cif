@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Cu9HPt4Au3O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.35151638
+_cell_length_b   5.35151638
+_cell_length_c   21.55424224
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Cu9HPt4Au3O
+_chemical_formula_sum   'Cu9 H1 Pt4 Au3 O1'
+_cell_volume   534.58542000
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Cu  Cu0  1  0.000000  0.000000  0.347959  1
+  Cu  Cu1  1  0.500000  0.000000  0.347959  1
+  Cu  Cu2  1  0.500000  0.500000  0.347959  1
+  Au  Au3  1  0.000000  0.500000  0.347959  1
+  Cu  Cu4  1  0.666667  0.333333  0.449320  1
+  Cu  Cu5  1  0.166667  0.333333  0.449320  1
+  Cu  Cu6  1  0.166667  0.833333  0.449320  1
+  Au  Au7  1  0.666667  0.833333  0.449320  1
+  Cu  Cu8  1  0.328024  0.661625  0.553060  1
+  Cu  Cu9  1  0.833600  0.661625  0.553060  1
+  Cu  Cu10  1  0.831761  0.163523  0.552073  1
+  Au  Au11  1  0.335303  0.170606  0.549177  1
+  Pt  Pt12  1  0.984944  -0.025809  0.657337  1
+  Pt  Pt13  1  0.489247  -0.025809  0.657337  1
+  Pt  Pt14  1  0.486609  0.473217  0.666149  1
+  Pt  Pt15  1  -0.012131  0.475738  0.655069  1
+  O  O16  1  0.488486  0.476971  0.760005  1
+  H  H17  1  0.589885  0.679770  0.772856  1

@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Ag9HIr3Pt4O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.74175704
+_cell_length_b   5.74175704
+_cell_length_c   22.03218749
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Ag9HIr3Pt4O
+_chemical_formula_sum   'Ag9 Ir3 H1 Pt4 O1'
+_cell_volume   629.03943744
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Ag  Ag0  1  0.000000  0.000000  0.340411  1
+  Ag  Ag1  1  0.500000  0.000000  0.340411  1
+  Ag  Ag2  1  0.500000  0.500000  0.340411  1
+  Ir  Ir3  1  0.000000  0.500000  0.340411  1
+  Ag  Ag4  1  0.666667  0.333333  0.446804  1
+  Ag  Ag5  1  0.166667  0.333333  0.446804  1
+  Ag  Ag6  1  0.166667  0.833333  0.446804  1
+  Ir  Ir7  1  0.666667  0.833333  0.446804  1
+  Ag  Ag8  1  0.339827  0.674968  0.553874  1
+  Ag  Ag9  1  0.835141  0.674968  0.553874  1
+  Ag  Ag10  1  0.836219  0.172438  0.552770  1
+  Ir  Ir11  1  0.340988  0.181976  0.561476  1
+  Pt  Pt12  1  1.009505  0.007805  0.659049  1
+  Pt  Pt13  1  0.498299  0.007805  0.659049  1
+  Pt  Pt14  1  0.497135  0.494270  0.665697  1
+  Pt  Pt15  1  1.001534  0.503069  0.660347  1
+  O  O16  1  0.534119  0.568239  0.756177  1
+  H  H17  1  0.631102  0.762203  0.763717  1

@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Fe3HPt4Rh9O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.30349861
+_cell_length_b   5.30349861
+_cell_length_c   21.49543272
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Fe3HPt4Rh9O
+_chemical_formula_sum   'Fe3 H1 Rh9 Pt4 O1'
+_cell_volume   523.60253663
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Rh  Rh0  1  0.000000  0.000000  0.348911  1
+  Rh  Rh1  1  0.500000  0.000000  0.348911  1
+  Rh  Rh2  1  0.500000  0.500000  0.348911  1
+  Fe  Fe3  1  1.000000  0.500000  0.348911  1
+  Rh  Rh4  1  0.666667  0.333333  0.449637  1
+  Rh  Rh5  1  0.166667  0.333333  0.449637  1
+  Rh  Rh6  1  0.166667  0.833333  0.449637  1
+  Fe  Fe7  1  0.666667  0.833333  0.449637  1
+  Rh  Rh8  1  0.336760  0.664232  0.548517  1
+  Rh  Rh9  1  0.827472  0.664232  0.548517  1
+  Rh  Rh10  1  0.831228  0.162456  0.546451  1
+  Fe  Fe11  1  0.333754  0.167508  0.548344  1
+  Pt  Pt12  1  0.004569  1.005921  0.653890  1
+  Pt  Pt13  1  0.501352  1.005921  0.653890  1
+  Pt  Pt14  1  0.502514  0.505029  0.662005  1
+  Pt  Pt15  1  0.002046  0.504092  0.657042  1
+  O  O16  1  0.479240  0.458480  0.756708  1
+  H  H17  1  0.577574  0.655147  0.774272  1

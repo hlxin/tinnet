@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Mn3HPt13O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.55199099
+_cell_length_b   5.55199099
+_cell_length_c   21.79977249
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Mn3HPt13O
+_chemical_formula_sum   'Mn3 H1 Pt13 O1'
+_cell_volume   581.94252946
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Pt  Pt0  1  0.000000  0.000000  0.344040  1
+  Pt  Pt1  1  0.500000  0.000000  0.344040  1
+  Pt  Pt2  1  0.500000  0.500000  0.344040  1
+  Mn  Mn3  1  1.000000  0.500000  0.344040  1
+  Pt  Pt4  1  0.666667  0.333333  0.448013  1
+  Pt  Pt5  1  0.166667  0.333333  0.448013  1
+  Pt  Pt6  1  0.166667  0.833333  0.448013  1
+  Mn  Mn7  1  0.666667  0.833333  0.448013  1
+  Pt  Pt8  1  0.336472  0.660713  0.548891  1
+  Pt  Pt9  1  0.824241  0.660713  0.548891  1
+  Pt  Pt10  1  0.829471  0.158942  0.546594  1
+  Mn  Mn11  1  0.331800  0.163600  0.552739  1
+  Pt  Pt12  1  0.010545  0.010035  0.651157  1
+  Pt  Pt13  1  0.499490  1.010035  0.651157  1
+  Pt  Pt14  1  0.505822  0.511643  0.659034  1
+  Pt  Pt15  1  1.002267  0.504533  0.654926  1
+  O  O16  1  0.485004  0.470008  0.751464  1
+  H  H17  1  0.579297  0.658594  0.768381  1

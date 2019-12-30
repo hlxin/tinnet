@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Nb3Ni9HPt4O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.20858823
+_cell_length_b   5.20858823
+_cell_length_c   21.37919173
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Nb3Ni9HPt4O
+_chemical_formula_sum   'Nb3 Ni9 H1 Pt4 O1'
+_cell_volume   502.29859686
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Ni  Ni0  1  0.000000  0.000000  0.350808  1
+  Ni  Ni1  1  0.500000  0.000000  0.350808  1
+  Ni  Ni2  1  0.500000  0.500000  0.350808  1
+  Nb  Nb3  1  1.000000  0.500000  0.350808  1
+  Ni  Ni4  1  0.666667  0.333333  0.450269  1
+  Ni  Ni5  1  0.166667  0.333333  0.450269  1
+  Ni  Ni6  1  0.166667  0.833333  0.450269  1
+  Nb  Nb7  1  0.666667  0.833333  0.450269  1
+  Ni  Ni8  1  0.333989  0.660400  0.549253  1
+  Ni  Ni9  1  0.826411  0.660400  0.549253  1
+  Ni  Ni10  1  0.837072  0.174145  0.546312  1
+  Nb  Nb11  1  0.333314  0.166628  0.552997  1
+  Pt  Pt12  1  0.003569  0.008540  0.654224  1
+  Pt  Pt13  1  0.504971  0.008540  0.654224  1
+  Pt  Pt14  1  0.506589  0.513178  0.662209  1
+  Pt  Pt15  1  0.003727  0.507453  0.655381  1
+  O  O16  1  0.475817  0.451634  0.758871  1
+  H  H17  1  0.574683  0.649366  0.777773  1

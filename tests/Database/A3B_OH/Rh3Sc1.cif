@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Sc3HPt4Rh9O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.55620354
+_cell_length_b   5.55620354
+_cell_length_c   21.80493179
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Sc3HPt4Rh9O
+_chemical_formula_sum   'Sc3 H1 Rh9 Pt4 O1'
+_cell_volume   582.96389374
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Rh  Rh0  1  0.000000  0.000000  0.343959  1
+  Rh  Rh1  1  0.500000  0.000000  0.343959  1
+  Rh  Rh2  1  0.500000  0.500000  0.343959  1
+  Sc  Sc3  1  0.000000  0.500000  0.343959  1
+  Rh  Rh4  1  0.666667  0.333333  0.447986  1
+  Rh  Rh5  1  0.166667  0.333333  0.447986  1
+  Rh  Rh6  1  0.166667  0.833333  0.447986  1
+  Sc  Sc7  1  0.666667  0.833333  0.447986  1
+  Rh  Rh8  1  0.328608  0.657129  0.552225  1
+  Rh  Rh9  1  0.828521  0.657129  0.552225  1
+  Rh  Rh10  1  0.832596  0.165193  0.549263  1
+  Sc  Sc11  1  0.330554  0.161108  0.552891  1
+  Pt  Pt12  1  0.006381  0.012326  0.655796  1
+  Pt  Pt13  1  0.505945  0.012326  0.655796  1
+  Pt  Pt14  1  0.509302  0.518604  0.659129  1
+  Pt  Pt15  1  0.005989  0.511978  0.656059  1
+  O  O16  1  0.472824  0.445647  0.751860  1
+  H  H17  1  0.564219  0.628437  0.771634  1

@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_HPd9Pt4Pb3O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.81438755
+_cell_length_b   5.81438755
+_cell_length_c   22.12114133
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   HPd9Pt4Pb3O
+_chemical_formula_sum   'Pd9 H1 Pt4 Pb3 O1'
+_cell_volume   647.65856577
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Pd  Pd0  1  0.000000  0.000000  0.339042  1
+  Pd  Pd1  1  0.500000  0.000000  0.339042  1
+  Pd  Pd2  1  0.500000  0.500000  0.339042  1
+  Pb  Pb3  1  0.000000  0.500000  0.339042  1
+  Pd  Pd4  1  0.666667  0.333333  0.446347  1
+  Pd  Pd5  1  0.166667  0.333333  0.446347  1
+  Pd  Pd6  1  0.166667  0.833333  0.446347  1
+  Pb  Pb7  1  0.666667  0.833333  0.446347  1
+  Pd  Pd8  1  0.329531  0.655182  0.555430  1
+  Pd  Pd9  1  0.825652  0.655182  0.555430  1
+  Pd  Pd10  1  0.832792  0.165585  0.552046  1
+  Pb  Pb11  1  0.329240  0.158480  0.555319  1
+  Pt  Pt12  1  -0.003493  0.001521  0.659166  1
+  Pt  Pt13  1  0.505014  0.001521  0.659166  1
+  Pt  Pt14  1  0.507922  0.515845  0.664714  1
+  Pt  Pt15  1  0.001221  0.502443  0.657981  1
+  O  O16  1  0.476370  0.452739  0.753954  1
+  H  H17  1  0.565296  0.630592  0.771929  1

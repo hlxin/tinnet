@@ -1,0 +1,44 @@
+# generated using pymatgen
+data_Ti3HIr9Pt4O
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   5.48055060
+_cell_length_b   5.48055060
+_cell_length_c   21.71227624
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Ti3HIr9Pt4O
+_chemical_formula_sum   'Ti3 Ir9 H1 Pt4 O1'
+_cell_volume   564.78658368
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Ir  Ir0  1  0.000000  0.000000  0.345427  1
+  Ir  Ir1  1  0.500000  0.000000  0.345427  1
+  Ir  Ir2  1  0.500000  0.500000  0.345427  1
+  Ti  Ti3  1  0.000000  0.500000  0.345427  1
+  Ir  Ir4  1  0.666667  0.333333  0.448476  1
+  Ir  Ir5  1  0.166667  0.333333  0.448476  1
+  Ir  Ir6  1  0.166667  0.833333  0.448476  1
+  Ti  Ti7  1  0.666667  0.833333  0.448476  1
+  Ir  Ir8  1  0.333495  0.658984  0.549833  1
+  Ir  Ir9  1  0.825489  0.658984  0.549833  1
+  Ir  Ir10  1  0.831365  0.162730  0.548370  1
+  Ti  Ti11  1  0.330392  0.160785  0.550887  1
+  Pt  Pt12  1  1.005769  0.007527  0.654080  1
+  Pt  Pt13  1  0.501758  0.007527  0.654080  1
+  Pt  Pt14  1  0.504379  0.508758  0.657315  1
+  Pt  Pt15  1  1.003159  0.506319  0.657688  1
+  O  O16  1  0.474791  0.449582  0.751263  1
+  H  H17  1  0.568222  0.636444  0.770306  1
