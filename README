@@ -1,13 +1,13 @@
-# piml: Physics-Informed Machine Learning #
+# timl: Theory-Infused Machine Learning #
 
 
-*piml* is an open-source package designed to easily integrate physical models with machine learning. This project is being developed at Xin Research Group, and is released under the GNU General Public License.  *piml* allows for the physical representation of active sites, enabling the user to specify or create feature and machine learning methods.
+*timl* is an open-source package designed to easily integrate physical models with machine learning. This project is being developed at Xin Research Group, and is released under the GNU General Public License.  *timl* allows for the physical representation of active sites, enabling the user to specify or create feature and machine learning methods.
 
 This project lives at:
-https://github.com/hlxin/piml
+https://github.com/hlxin/timl
 
 Documentation lives at:
-https://github.com/hlxin/piml/docs
+https://github.com/hlxin/timl/docs
 
 Users' mailing list lives at:
 ??
@@ -37,15 +37,15 @@ License
 Installation
 ============
 
-You can find the installation instructions for this version of piml in the
+You can find the installation instructions for this version of timl in the
 documentation file `docs/installation.rst`.
 
 Documentation
 =============
 
 We currently host multiple versions of the documentation, which includes
-installation instructions, at https://github.com/hlxin/piml/docs
+installation instructions, at https://github.com/hlxin/timl/docs
 
-You can build a local copy of the documentation for this version of piml.
+You can build a local copy of the documentation for this version of timl.
 You will find instructions to do this in the "Documentation" section of the
 file `docs/develop.rst`.
