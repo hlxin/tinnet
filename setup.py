@@ -14,13 +14,13 @@ except ImportError:
     raise RuntimeError(msg)
 
 
-name = 'piml'
-version = open(os.path.join('piml', 'VERSION')).read().strip()
+name = 'timl'
+version = open(os.path.join('timl', 'VERSION')).read().strip()
 description = 'Physics-Informed Machine Learning'
 long_description = open('README').read()
-packages = ['piml', 'piml.feature', 'piml.regression',
-            'piml.model', 'piml.stats']
-Package_dir = {'piml': 'piml', 'feature': 'feature',
+packages = ['timl', 'timl.feature', 'timl.regression',
+            'timl.model', 'timl.stats']
+Package_dir = {'timl': 'timl', 'feature': 'feature',
                'regression': 'regression', 'model': 'model', 'stats': 'stats'}
 classifiers = ['Programming Language :: Python',
                'Programming Language :: Python :: 2.6',
@@ -29,18 +29,18 @@ classifiers = ['Programming Language :: Python',
                'Programming Language :: Python :: 3.3']
 install_requires = ['numpy>=1.7.0', 'matplotlib', 'ase', 'pyzmq',
                     'pexpect']
-ext_modules = [Extension(name='piml.fmodules',
-                         sources=['piml/model/neuralnetwork.f90',
-                                  'piml/feature/gaussian.f90',
-                                  'piml/feature/cutoffs.f90',
-                                  'piml/feature/zernike.f90',
-                                  'piml/model.f90'])]
+ext_modules = [Extension(name='timl.fmodules',
+                         sources=['timl/model/neuralnetwork.f90',
+                                  'timl/feature/gaussian.f90',
+                                  'timl/feature/cutoffs.f90',
+                                  'timl/feature/zernike.f90',
+                                  'timl/model.f90'])]
 author = 'Hongliang Xin'
 author_email = 'hxin@vt.edu'
-url = 'https://github.com/hlxin/piml'
-package_data = {'piml': ['VERSION']}
+url = 'https://github.com/hlxin/timl'
+package_data = {'timl': ['VERSION']}
 
-scripts = ['tools/piml-compress', 'tools/piml-plotconvergence']
+scripts = ['tools/timl-compress', 'tools/timl-plotconvergence']
 
 try:
     setup(name=name,
@@ -59,7 +59,7 @@ try:
           package_data=package_data,
           )
 except SystemExit as ex:
-    if 'piml.fmodules' in ex.args[0]:
+    if 'timl.fmodules' in ex.args[0]:
         warnings.warn('It looks like no fortran compiler is present. Retrying '
                       'installation without fortran modules.')
     else:
@@ -79,5 +79,5 @@ except SystemExit as ex:
           url=url,
           package_data=package_data,
           )
-    warnings.warn('Installed Piml without fortran modules since no fortran '
+    warnings.warn('Installed Timl without fortran modules since no fortran '
                   'compiler was found. The code may run slow as a result.')

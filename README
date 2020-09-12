@@ -1,7 +1,7 @@
-# timl: Theory-Infused Machine Learning #
+# TIML: Theory-Infused Machine Learning #
 
 
-*timl* is an open-source package designed to easily integrate physical models with machine learning. This project is being developed at Xin Research Group, and is released under the GNU General Public License.  *timl* allows for the physical representation of active sites, enabling the user to specify or create feature and machine learning methods.
+*TIML* is an open-source package designed to easily integrate physical models with machine learning. This project is being developed at Xin Research Group, and is released under the GNU General Public License.  *timl* allows for the physical representation of active sites, enabling the user to specify or create feature and machine learning methods.
 
 This project lives at:
 https://github.com/hlxin/timl
