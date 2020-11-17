@@ -1,4 +1,4 @@
-# Theory-Infused Neural Network (TinNet)
+# Theory Infused Neural Network (TinNet)
 
 The TinNet software package is adapted from Crystal Graph Convolutional Neural Networks (CGCNN) codes of Jeffrey C. Grossman and Zachary W. Ulissi.
 - [Crystal Graph Convolutional Neural Networks (CGCNN)](https://link.aps.org/doi/10.1103/PhysRevLett.120.145301).
