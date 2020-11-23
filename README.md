@@ -51,8 +51,11 @@ To use the TinNet package, you need to load images and properties in the Python 
 There are three examples of TinNet models in the repository: 'Main/Tuning_Hyperparameters.py', 'Main/Training.py' and 'Main/Test.py'. 
 
 arguments:
+
 (1) task = {'train', 'test'}
+
 (2) data_format = {'regular', 'nested', 'test'}
+
 (3) phys_model = {'GCNN', 'newns_anderson_semi', 'user-defined'}
 
 ### Load images and properties
