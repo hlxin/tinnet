@@ -56,7 +56,7 @@ arguments:
 
 (2) data_format = {'regular', 'nested', 'test'}
 
-(3) phys_model = {'GCNN', 'newns_anderson_semi', 'user-defined'}
+(3) phys_model = {'gcnn', 'newns_anderson_semi', 'user-defined'}
 
 ### Load images and properties
 
