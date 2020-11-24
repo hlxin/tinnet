@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-# This script is adapted from Xie's and Ulissi's scripts.
+# This script is adapted from scripts of Jeffrey C. Grossman 
+# and Zachary W. Ulissi.
 
 import numpy as np
 from pymatgen.analysis.structure_analyzer import VoronoiConnectivity
@@ -19,6 +20,8 @@ class Voronoi:
         The minimum distance for constructing GaussianDistance
     step: float
         The step size for constructing GaussianDistance
+    dict_atom_fea: dict
+        A dictionary that stores the initialization vector for each element.
     
     Returns
     -------
@@ -30,8 +33,8 @@ class Voronoi:
 
     def __init__(self,
                  max_num_nbr=12,
-                 radius=8,
-                 dmin=0,
+                 radius=8.0,
+                 dmin=0.0,
                  step=0.2,
                  dict_atom_fea=None):
         
@@ -100,6 +103,7 @@ class Voronoi:
 
     def dict_atom_fea_default(self):
         # Default superstructure of atom features
+        # Comes from Jeffrey C. Grossman, atom_init.json
         atom_fea_dict = {
             1: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
