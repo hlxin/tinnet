@@ -26,7 +26,7 @@ from tinnet.phys.phys import Chemisorption
 class Regression:
     def __init__(self,
                  images,
-                 energy,
+                 main_target,
                  task,
                  data_format,
                  phys_model='gcnn',
@@ -35,40 +35,30 @@ class Regression:
                  momentum=0.9,
                  batch_size=256,
                  name_images=None,
-                 idx_validation=0,
-                 idx_test=None,
-                 lr=0.001,
-                 atom_fea_len=64,
-                 n_conv=3,
-                 h_fea_len=128,
-                 n_h=1,
-                 Esp=None,
-                 lamb=None,
-                 d_cen=None,
-                 width=None,
-                 vad2=None,
-                 dos_ads_1=None,
-                 dos_ads_2=None,
-                 dos_ads_3=None,
-                 emax=None,
-                 emin=None,
-                 num_datapoints=None,
-                 max_num_nbr=12, # for Voronoi descriptor
-                 radius=8, # for Voronoi descriptor
-                 dmin=0, # for Voronoi descriptor
-                 step=0.2, # for Voronoi descriptor
-                 dict_atom_fea=None, # for Voronoi descriptor
+                 idx_validation_fold=0,
+                 idx_test_fold=None,
                  print_freq=1,
                  num_workers=0,
                  lr_milestones=[100],
                  resume=None,
                  random_seed=1234,
                  start_epoch=0,
+                 lr=0.001,
+                 atom_fea_len=64,
+                 n_conv=3,
+                 h_fea_len=128,
+                 n_h=1,
+                 max_num_nbr=12,
+                 radius=8,
+                 dmin=0,
+                 step=0.2,
+                 dict_atom_fea=None,
+                 
                  **kwargs
                  ):
         
         # Initialize Physical Model
-        Chemisorption.__init__(self, phys_model, **kwargs)
+        Chemisorption.__init__(self, phys_model, main_target, task, **kwargs)
         
         descriptor = Voronoi(max_num_nbr=max_num_nbr,
                              radius=radius,
@@ -84,32 +74,13 @@ class Regression:
         nbr_fea = np.array([x[1] for x in features])
         nbr_fea_idx = np.array([x[2] for x in features])
         
-        target = energy
-        
-        if phys_model == 'newns_anderson_semi':
-            # h for Hilbert Transform            
-            h = np.zeros(num_datapoints)
-            if num_datapoints % 2 == 0:
-                h[0] = h[num_datapoints // 2] = 1
-                h[1:num_datapoints // 2] = 2
-            else:
-                h[0] = 1
-                h[1:(num_datapoints+1) // 2] = 2
-            
-            ergy = np.linspace(emin, emax, num_datapoints)
-            
-            if task == 'train':
-                target = np.zeros((len(energy),3+3*num_datapoints))
-            elif task == 'test':
-                target = energy
-        
         if name_images is None:
             name_images = np.arange(len(atom_fea))
 
         dataset = [((torch.Tensor(atom_fea[i]),
                      torch.Tensor(nbr_fea[i]),
                      torch.LongTensor(nbr_fea_idx[i])),
-                    torch.Tensor([target[i]]),
+                    torch.Tensor([self.target[i]]),
                     name_images[i])
                    for i in range(len(atom_fea))]
         
@@ -123,8 +94,9 @@ class Regression:
             self.get_train_val_test_loader(dataset=dataset,
                                            collate_fn=collate_fn,
                                            batch_size=batch_size,
-                                           idx_validation=idx_validation,
-                                           idx_test=idx_test,
+                                           idx_validation_fold=\
+                                               idx_validation_fold,
+                                           idx_test_fold=idx_test_fold,
                                            num_workers=num_workers,
                                            pin_memory=cuda,
                                            random_seed=random_seed,
@@ -190,47 +162,6 @@ class Regression:
                                 milestones=lr_milestones,
                                 gamma=0.1)
         
-        # Initialize the class
-        if phys_model == 'newns_anderson_semi':
-            
-            h = torch.FloatTensor(h)
-            ergy = torch.FloatTensor(ergy)
-            vad2 = torch.from_numpy(vad2).type(torch.FloatTensor)
-            energy = torch.from_numpy(energy).type(torch.FloatTensor)
-            
-            if cuda:
-                h = h.cuda()
-                ergy = ergy.cuda()
-                vad2 = vad2.cuda()
-                energy = energy.cuda()
-            
-            if task =='train':
-                d_cen = torch.from_numpy(d_cen).type(torch.FloatTensor)
-                width = torch.from_numpy(width).type(torch.FloatTensor)
-                dos_ads_1 = torch.from_numpy(dos_ads_1).type(torch.FloatTensor)
-                dos_ads_2 = torch.from_numpy(dos_ads_2).type(torch.FloatTensor)
-                dos_ads_3 = torch.from_numpy(dos_ads_3).type(torch.FloatTensor)
-                
-                if cuda:
-                    d_cen = d_cen.cuda()
-                    width = width.cuda()
-                    dos_ads_1 = dos_ads_1.cuda()
-                    dos_ads_2 = dos_ads_2.cuda()
-                    dos_ads_3 = dos_ads_3.cuda()
-                
-                self.d_cen = d_cen
-                self.width = width
-                self.dos_ads_1 = dos_ads_1
-                self.dos_ads_2 = dos_ads_2
-                self.dos_ads_3 = dos_ads_3
-            
-            self.h = h
-            self.ergy = ergy
-            self.vad2 = vad2
-            self.energy = energy
-            self.Esp = Esp
-            self.lamb = lamb
-            
         self.lr = lr
         self.cuda = cuda
         self.phys_model = phys_model
@@ -245,8 +176,8 @@ class Regression:
         self.scheduler = scheduler
         self.best_mse_error = best_mse_error
         self.best_counter = 0
-        self.idx_validation = idx_validation
-        self.idx_test = idx_test
+        self.idx_validation_fold = idx_validation_fold
+        self.idx_test_fold = idx_test_fold
         self.task = task
     
     def train(self, epochs=10, **kwargs):
@@ -277,9 +208,9 @@ class Regression:
             if self.best_counter >= 1000:
                 print('Exit due to converged')
                 filename = 'model_best_train_idx_val_' \
-                           + str(self.idx_validation) \
+                           + str(self.idx_validation_fold) \
                            + '_idx_test_' \
-                           + str(self.idx_test) \
+                           + str(self.idx_test_fold) \
                            + '.pth.tar'
                 torch.save(self.best_state, filename)
                 return self.best_val_mae, self.best_val_mse,\
@@ -290,9 +221,9 @@ class Regression:
     def check_loss(self, **kwargs):
         # test best model
         best_checkpoint = torch.load('model_best_train_idx_val_' \
-                                     + str(self.idx_validation) \
+                                     + str(self.idx_validation_fold) \
                                      + '_idx_test_' \
-                                     + str(self.idx_test) \
+                                     + str(self.idx_test_fold) \
                                      + '.pth.tar')
         
         self.model.load_state_dict(best_checkpoint['state_dict'])
@@ -372,14 +303,14 @@ class Regression:
                               mae_errors=mae_errors))
         
         np.savetxt('parm_' + name + '_idx_val_' \
-                   + str(self.idx_validation) \
+                   + str(self.idx_validation_fold) \
                    + '_idx_test_' \
-                   + str(self.idx_test) \
+                   + str(self.idx_test_fold) \
                    + '.txt', parm.detach().cpu().numpy())
         
         with open(name + '_results_idx_val_' \
-                  + str(self.idx_validation) \
-                  + '_idx_test_' + str(self.idx_test) + '.csv', 'w') as f:
+                  + str(self.idx_validation_fold) \
+                  + '_idx_test_' + str(self.idx_test_fold) + '.csv', 'w') as f:
             writer = csv.writer(f)
             for cif_id, target, pred in zip(batch_cif_ids, target, output):
                 writer.writerow((cif_id,
@@ -558,8 +489,8 @@ class Regression:
     
     def get_train_val_test_loader(self,
                                   dataset,
-                                  idx_validation=0,
-                                  idx_test=None,
+                                  idx_validation_fold=0,
+                                  idx_test_fold=None,
                                   collate_fn=default_collate,
                                   batch_size=256,
                                   num_workers=0,
@@ -602,16 +533,17 @@ class Regression:
             
             kfold = np.array_split(indices,10)
             
-            kfold_val = deepcopy(kfold[idx_validation])
+            kfold_val = deepcopy(kfold[idx_validation_fold])
             
             try:
-                kfold_test = deepcopy(kfold[idx_test])
+                kfold_test = deepcopy(kfold[idx_test_fold])
             except:
                 kfold_test = []
             
             kfold_train = deepcopy([kfold[i]
                                     for i in range(0,10)
-                                    if i != idx_validation and i != idx_test])
+                                    if i != idx_validation_fold 
+                                       and i != idx_test_fold])
             
             kfold_train = np.array([item for sl in kfold_train for item in sl])
             
@@ -624,21 +556,21 @@ class Regression:
             kfold = np.array_split(indices,10)
                 
             try:
-                kfold_test = deepcopy(kfold[idx_test])
+                kfold_test = deepcopy(kfold[idx_test_fold])
                 kfold_rest = deepcopy([kfold[i]
                                        for i in range(0,10)
-                                       if i != idx_test])
+                                       if i != idx_test_fold])
                 kfold_rest = np.array([item for s in kfold_rest for item in s])
                 kfold = np.array_split(kfold_rest,10)
             
             except:
                 kfold_test = []
             
-            kfold_val = deepcopy(kfold[idx_validation])
+            kfold_val = deepcopy(kfold[idx_validation_fold])
             
             kfold_train = deepcopy([kfold[i]
                                     for i in range(0,10)
-                                    if i != idx_validation])
+                                    if i != idx_validation_fold])
             
             kfold_train = np.array([item for sl in kfold_train for item in sl])
             
