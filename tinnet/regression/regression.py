@@ -2,10 +2,8 @@ from __future__ import print_function, division
 
 import os
 import time
-import warnings
 import random
 import csv
-from random import sample
 from copy import deepcopy
 
 import multiprocessing
@@ -34,7 +32,6 @@ class Regression:
                  weight_decay=0,
                  momentum=0.9,
                  batch_size=256,
-                 name_images=None,
                  idx_validation_fold=0,
                  idx_test_fold=None,
                  print_freq=1,
@@ -43,11 +40,16 @@ class Regression:
                  resume=None,
                  random_seed=1234,
                  start_epoch=0,
+                 convergence_epochs=1000,
+                 
+                 # hyperparameters
                  lr=0.001,
                  atom_fea_len=64,
                  n_conv=3,
                  h_fea_len=128,
                  n_h=1,
+                 
+                 # parameters for Voronoi descriptor
                  max_num_nbr=12,
                  radius=8,
                  dmin=0,
@@ -57,14 +59,21 @@ class Regression:
                  **kwargs
                  ):
         
-        # Initialize Physical Model
+        # initialize physical model
         Chemisorption.__init__(self, phys_model, main_target, task, **kwargs)
         
+        # initial settings
+        best_mse_error =  1e10
+        cuda = torch.cuda.is_available()
+        collate_fn = self.collate_pool
+        
+        # calculate graph features (Voronoi descriptor)
         descriptor = Voronoi(max_num_nbr=max_num_nbr,
                              radius=radius,
                              dmin=dmin,
                              step=step,
                              dict_atom_fea=dict_atom_fea)
+        
         try:
             features = multiprocessing.Pool().map(descriptor.feas, images)
         except:
@@ -74,21 +83,15 @@ class Regression:
         nbr_fea = np.array([x[1] for x in features])
         nbr_fea_idx = np.array([x[2] for x in features])
         
-        if name_images is None:
-            name_images = np.arange(len(atom_fea))
-
+        idx_images = np.arange(len(atom_fea))
+        
+        # set up dataset and loaders
         dataset = [((torch.Tensor(atom_fea[i]),
                      torch.Tensor(nbr_fea[i]),
                      torch.LongTensor(nbr_fea_idx[i])),
                     torch.Tensor([self.target[i]]),
-                    name_images[i])
+                    idx_images[i])
                    for i in range(len(atom_fea))]
-        
-        best_mse_error =  1e10
-        
-        cuda = torch.cuda.is_available()
-        
-        collate_fn = self.collate_pool
         
         train_loader, val_loader, test_loader =\
             self.get_train_val_test_loader(dataset=dataset,
@@ -101,16 +104,6 @@ class Regression:
                                            pin_memory=cuda,
                                            random_seed=random_seed,
                                            data_format=data_format)
-        
-        # obtain target value normalizer
-        if len(dataset) < 500:
-            warnings.warn('Dataset has less than 500 data points. '
-                          'Lower accuracy is expected. ')
-            sample_data_list = [dataset[i] for i in range(len(dataset))]
-        else:
-            sample_data_list = [dataset[i] for i in
-                                sample(range(len(dataset)), 500)]
-        _, sample_target, _ = self.collate_pool(sample_data_list)
         
         # build model
         structures, _, _ = dataset[0]
@@ -131,6 +124,7 @@ class Regression:
         criterion = nn.MSELoss()
         
         # define optimizer
+        # users can add their own optimizers as needed
         if optim_algorithm == 'SGD':
             optimizer = optim.SGD(model.parameters(), lr,
                                   momentum=momentum,
@@ -143,6 +137,10 @@ class Regression:
                                     weight_decay=weight_decay)
         else:
             raise NameError('Only SGD, Adam or AdamW is allowed')
+        
+        scheduler = MultiStepLR(optimizer,
+                                milestones=lr_milestones,
+                                gamma=0.1)
         
         # optionally resume from a checkpoint
         if resume:
@@ -157,10 +155,6 @@ class Regression:
                       .format(resume, checkpoint['epoch']))
             else:
                 print('=> no checkpoint found at "{}"'.format(resume))
-        
-        scheduler = MultiStepLR(optimizer,
-                                milestones=lr_milestones,
-                                gamma=0.1)
         
         self.lr = lr
         self.cuda = cuda
@@ -179,6 +173,7 @@ class Regression:
         self.idx_validation_fold = idx_validation_fold
         self.idx_test_fold = idx_test_fold
         self.task = task
+        self.convergence_epochs = convergence_epochs
     
     def train(self, epochs=10, **kwargs):
         for epoch in range(self.start_epoch, self.start_epoch + epochs):
@@ -191,7 +186,7 @@ class Regression:
             
             if val_mse != val_mse:
                 print('Exit due to NaN')
-                return 1e10, 1e10, 1e10, 1e10
+                return None, None, None, None
             
             self.scheduler.step()
             
@@ -205,7 +200,7 @@ class Regression:
                                   'optimizer': self.optimizer.state_dict(),
                                   }, is_best, **kwargs)
 
-            if self.best_counter >= 1000:
+            if self.best_counter >= self.convergence_epochs:
                 print('Exit due to converged')
                 filename = 'model_best_train_idx_val_' \
                            + str(self.idx_validation_fold) \
@@ -216,7 +211,7 @@ class Regression:
                 return self.best_val_mae, self.best_val_mse,\
                     self.best_test_mae, self.best_test_mse
         
-        return 1e10, 1e10, 1e10, 1e10
+        return None, None, None, None
 
     def check_loss(self, **kwargs):
         # test best model
