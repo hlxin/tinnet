@@ -43,15 +43,15 @@ class Chemisorption:
             ergy = np.linspace(emin, emax, num_datapoints)
             
             esp = kwargs['constant_1']
-            lamb = kwargs['constant_2']
+            root_lamb = kwargs['constant_2']
             vad2 = kwargs['constant_3']
             
             if task == 'train':
-                d_cen = kwargs['extra_traget_1']
-                half_width = kwargs['extra_traget_2']
-                dos_ads_3sigma = kwargs['extra_traget_3']
-                dos_ads_1pi = kwargs['extra_traget_4']
-                dos_ads_4sigma = kwargs['extra_traget_5']
+                d_cen = kwargs['additional_traget_1']
+                half_width = kwargs['additional_traget_2']
+                dos_ads_3sigma = kwargs['additional_traget_3']
+                dos_ads_1pi = kwargs['additional_traget_4']
+                dos_ads_4sigma = kwargs['additional_traget_5']
                 
                 d_cen = torch.from_numpy(d_cen).type(torch.FloatTensor)
                 half_width = torch.from_numpy(half_width)\
@@ -99,9 +99,19 @@ class Chemisorption:
             self.ergy = ergy
             self.vad2 = vad2
             self.esp = esp
-            self.lamb = lamb
+            self.root_lamb = root_lamb
             self.main_target = main_target
-    
+            
+        if model_name == 'user_defined':
+            self.model_num_input = 1
+            self.num_targets = 1
+            self.main_target = main_target
+            
+            if task == 'train':
+                self.target = np.zeros((main_target.shape[0],self.num_targets))
+            elif task == 'test':
+                self.target = main_target
+        
     def newns_anderson_semi(self, namodel_in, model, task , **kwargs):
         
         adse_1 = namodel_in[:,0]
@@ -192,11 +202,12 @@ class Chemisorption:
             ans = torch.cat(((dft_energy-model_energy).view(-1, 1),
                              (dft_d_cen-model_d_cen).view(-1, 1),
                              (dft_half_width-model_half_width).view(-1, 1),
-                             self.lamb*(dft_dos_ads_3sigma
-                                        - model_dos_ads_3sigma),
-                             self.lamb*(dft_dos_ads_1pi-model_dos_ads_1pi),
-                             self.lamb*(dft_dos_ads_4sigma
-                                        - model_dos_ads_4sigma)),1)
+                             self.root_lamb*(dft_dos_ads_3sigma
+                                             - model_dos_ads_3sigma),
+                             self.root_lamb*(dft_dos_ads_1pi
+                                             - model_dos_ads_1pi),
+                             self.root_lamb*(dft_dos_ads_4sigma
+                                             - model_dos_ads_4sigma)),1)
             ans = ans.view(len(ans),1,-1)
         
         elif task == 'test':
@@ -247,3 +258,8 @@ class Chemisorption:
     def gcnn(self, gcnnmodel_in, **kwargs):
         # Do nothing
         return gcnnmodel_in, gcnnmodel_in
+
+    def user_defined(self, user_defined_model_in, **kwargs):
+        # Do something:
+        return user_defined_model_in, user_defined_model_in
+    
