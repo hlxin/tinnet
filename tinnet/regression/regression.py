@@ -1,3 +1,7 @@
+#!/usr/bin/env python
+# This script is adapted from scripts of Jeffrey C. Grossman 
+# and Zachary W. Ulissi.
+
 from __future__ import print_function, division
 
 import os
@@ -18,7 +22,7 @@ from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler
 
 from tinnet.feature.voronoi import Voronoi
-from tinnet.phys.phys import Chemisorption
+from tinnet.theory.theory import Chemisorption
 
 
 class Regression:
@@ -63,7 +67,7 @@ class Regression:
         Chemisorption.__init__(self, phys_model, main_target, task, **kwargs)
         
         # initial settings
-        best_mse_error =  1e10
+        best_mse_error =  np.inf
         cuda = torch.cuda.is_available()
         collate_fn = self.collate_pool
         
@@ -213,7 +217,7 @@ class Regression:
         
         return None, None, None, None
 
-    def check_loss(self, **kwargs):
+    def predict(self, **kwargs):
         # test best model
         best_checkpoint = torch.load('model_best_train_idx_val_' \
                                      + str(self.idx_validation_fold) \
@@ -272,15 +276,20 @@ class Regression:
                 output, parm = Chemisorption.newns_anderson_semi(
                     self,
                     cnn_output,
-                    model='model',
+                    dos_source='model',
                     task=self.task,
                     **dict(**kwargs, batch_cif_ids=batch_cif_ids))
+            
+            if self.phys_model =='user_defined':
+                output, parm = Chemisorption.user_defined(self,
+                                                  cnn_output,
+                                                  **kwargs)
             
             loss = self.criterion(output, target_var)*output.shape[-1]
             
             # measure accuracy and record loss
-            mae_error = self.mae(output.data.cpu(),target)*output.shape[-1]
-            losses.update(loss.data.cpu(), target.size(0))
+            mae_error = self.mae(output.data,target_var)*output.shape[-1]
+            losses.update(loss.data, target.size(0))
             mae_errors.update(mae_error, target.size(0))
             
             # measure elapsed time
@@ -358,26 +367,32 @@ class Regression:
                 output, parm = Chemisorption.newns_anderson_semi(
                     self,
                     cnn_output,
-                    model='dft',
+                    dos_source='dft',
                     task=self.task,
                     **dict(**kwargs, batch_cif_ids=batch_cif_ids))
+            
+            if self.phys_model =='user_defined':
+                output, parm = Chemisorption.user_defined(self,
+                                                  cnn_output,
+                                                  **kwargs)
             
             loss = self.criterion(output, target_var)*output.shape[-1]
             
             # measure accuracy and record loss
-            mae_error = self.mae(output.data.cpu(),target)*output.shape[-1]
-            losses.update(loss.data.cpu(), target.size(0))
+            mae_error = self.mae(output.data,target_var)*output.shape[-1]
+            losses.update(loss.data, target.size(0))
             mae_errors.update(mae_error, target.size(0))
             
             # compute gradient and do SGD/Adam step
             self.optimizer.zero_grad()
+            
             loss.backward()
             self.optimizer.step()
-    
+            
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
-    
+            
             if i % self.print_freq == 0:
                 print('Epoch: [{0}][{1}/{2}]\t'
                       'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
@@ -433,15 +448,20 @@ class Regression:
                 output, parm = Chemisorption.newns_anderson_semi(
                     self,
                     cnn_output,
-                    model='model',
+                    dos_source='model',
                     task=self.task,
                     **dict(**kwargs, batch_cif_ids=batch_cif_ids))
+            
+            if self.phys_model =='user_defined':
+                output, parm = Chemisorption.user_defined(self,
+                                                  cnn_output,
+                                                  **kwargs)
             
             loss = self.criterion(output, target_var)*output.shape[-1]
             
             # measure accuracy and record loss
-            mae_error = self.mae(output.data.cpu(),target)*output.shape[-1]
-            losses.update(loss.data.cpu(), target.size(0))
+            mae_error = self.mae(output.data,target_var)*output.shape[-1]
+            losses.update(loss.data, target.size(0))
             mae_errors.update(mae_error, target.size(0))
             
             # measure elapsed time
@@ -459,6 +479,9 @@ class Regression:
                               mae_errors=mae_errors))
         
         return losses.avg, mae_errors.avg
+    
+    def state_dict(self):
+        return self.model.state_dict()
     
     def mae(self, prediction, target):
         '''
@@ -584,13 +607,13 @@ class Regression:
                                   collate_fn=collate_fn,
                                   pin_memory=pin_memory)
         
-        val_loader = DataLoader(dataset, batch_size=1024,
+        val_loader = DataLoader(dataset, batch_size=len(dataset),
                                 sampler=val_sampler,
                                 num_workers=num_workers,
                                 collate_fn=collate_fn,
                                 pin_memory=pin_memory)
         
-        test_loader = DataLoader(dataset, batch_size=1024,
+        test_loader = DataLoader(dataset, batch_size=len(dataset),
                                  sampler=test_sampler,
                                  num_workers=num_workers,
                                  collate_fn=collate_fn,
@@ -702,7 +725,7 @@ class ConvLayer(nn.Module):
         self.bn1 = nn.BatchNorm1d(2*self.atom_fea_len)
         self.bn2 = nn.BatchNorm1d(self.atom_fea_len)
         self.softplus2 = nn.Softplus()
-
+    
     def forward(self, atom_in_fea, nbr_fea, nbr_fea_idx):
         '''
         Forward pass
@@ -846,6 +869,8 @@ class CrystalGraphConvNet(nn.Module):
         '''
         assert sum([len(idx_map) for idx_map in crystal_atom_idx]) ==\
             atom_fea.data.shape[0]
+        
         summed_fea = [torch.mean(atom_fea[idx_map], dim=0, keepdim=True)
                       for idx_map in crystal_atom_idx]
+        
         return torch.cat(summed_fea, dim=0)

@@ -43,10 +43,10 @@ class Chemisorption:
             ergy = np.linspace(emin, emax, num_datapoints)
             
             esp = kwargs['constant_1']
-            root_lamb = kwargs['constant_2']
             vad2 = kwargs['constant_3']
             
             if task == 'train':
+                root_lamb = kwargs['constant_2']
                 d_cen = kwargs['additional_traget_1']
                 half_width = kwargs['additional_traget_2']
                 dos_ads_3sigma = kwargs['additional_traget_3']
@@ -74,6 +74,7 @@ class Chemisorption:
                 
                 self.target = np.zeros((main_target.shape[0],num_targets))
                 
+                self.root_lamb = root_lamb
                 self.d_cen = d_cen
                 self.half_width = half_width
                 self.dos_ads_3sigma = dos_ads_3sigma
@@ -99,7 +100,6 @@ class Chemisorption:
             self.ergy = ergy
             self.vad2 = vad2
             self.esp = esp
-            self.root_lamb = root_lamb
             self.main_target = main_target
             
         if model_name == 'user_defined':
@@ -112,7 +112,7 @@ class Chemisorption:
             elif task == 'test':
                 self.target = main_target
         
-    def newns_anderson_semi(self, namodel_in, model, task , **kwargs):
+    def newns_anderson_semi(self, namodel_in, dos_source, task , **kwargs):
         
         adse_1 = namodel_in[:,0]
         beta_1 = torch.nn.functional.softplus(namodel_in[:,1])
@@ -144,7 +144,7 @@ class Chemisorption:
         self.fermi = np.argsort(abs(ergy.detach().cpu().numpy()))[0] + 1
         
         # Semi-ellipse
-        if model == 'dft':
+        if dos_source == 'dft':
             dos_d = 1-((ergy[None,:]-dft_d_cen[:,None])
                        / dft_half_width[:,None])**2
             dos_d = abs(dos_d)**0.5
