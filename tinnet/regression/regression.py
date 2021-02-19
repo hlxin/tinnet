@@ -7,7 +7,8 @@ from __future__ import print_function, division
 import os
 import time
 import random
-import csv
+import shutil
+import pickle
 from copy import deepcopy
 
 import multiprocessing
@@ -15,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from ase.db import connect
 from torch.autograd import Variable
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
@@ -29,16 +31,17 @@ class Regression:
     def __init__(self,
                  images,
                  main_target,
-                 task,
                  data_format,
                  phys_model='gcnn',
                  optim_algorithm='Adam',
                  weight_decay=0,
                  momentum=0.9,
                  batch_size=256,
-                 idx_validation_fold=0,
-                 idx_test_fold=None,
-                 print_freq=1,
+                 idx_val_fold=0,
+                 idx_test_fold=0,
+                 train_ratio=0.9,
+                 val_ratio=0.1,
+                 test_ratio=0.0,
                  num_workers=0,
                  lr_milestones=[100],
                  resume=None,
@@ -64,7 +67,7 @@ class Regression:
                  ):
         
         # initialize physical model
-        Chemisorption.__init__(self, phys_model, main_target, task, **kwargs)
+        Chemisorption.__init__(self, phys_model, main_target, **kwargs)
         
         # initial settings
         best_mse_error =  np.inf
@@ -77,6 +80,7 @@ class Regression:
                              dmin=dmin,
                              step=step,
                              dict_atom_fea=dict_atom_fea)
+        
         
         try:
             features = multiprocessing.Pool().map(descriptor.feas, images)
@@ -101,9 +105,11 @@ class Regression:
             self.get_train_val_test_loader(dataset=dataset,
                                            collate_fn=collate_fn,
                                            batch_size=batch_size,
-                                           idx_validation_fold=\
-                                               idx_validation_fold,
+                                           idx_val_fold=idx_val_fold,
                                            idx_test_fold=idx_test_fold,
+                                           train_ratio=train_ratio,
+                                           val_ratio=val_ratio,
+                                           test_ratio=test_ratio,
                                            num_workers=num_workers,
                                            pin_memory=cuda,
                                            random_seed=random_seed,
@@ -160,10 +166,8 @@ class Regression:
             else:
                 print('=> no checkpoint found at "{}"'.format(resume))
         
-        self.lr = lr
         self.cuda = cuda
         self.phys_model = phys_model
-        self.print_freq = print_freq
         self.start_epoch = start_epoch
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -174,12 +178,14 @@ class Regression:
         self.scheduler = scheduler
         self.best_mse_error = best_mse_error
         self.best_counter = 0
-        self.idx_validation_fold = idx_validation_fold
-        self.idx_test_fold = idx_test_fold
-        self.task = task
         self.convergence_epochs = convergence_epochs
+        self.images = images
     
     def train(self, epochs=10, **kwargs):
+        
+        epoch_loss_pkl = open('epoch_loss.pkl', 'wb')
+        epoch_loss = {}
+        
         for epoch in range(self.start_epoch, self.start_epoch + epochs):
             self.epoch = epoch
             train_mse, train_mae = self.train_model(**kwargs)
@@ -188,9 +194,23 @@ class Regression:
             val_mse, val_mae \
                 = self.eval_model('validation', self.val_loader, **kwargs)
             
+            # evaluate on test set
+            test_mse, test_mae \
+                = self.eval_model('test', self.test_loader, **kwargs)
+            
+            epoch_loss[epoch] = {}
+            epoch_loss[epoch]['train_mse'] = train_mse.item()
+            epoch_loss[epoch]['train_mae'] = train_mae.item()
+            epoch_loss[epoch]['val_mse'] = val_mse.item()
+            epoch_loss[epoch]['val_mae'] = val_mae.item()
+            epoch_loss[epoch]['test_mse'] = test_mse.item()
+            epoch_loss[epoch]['test_mae'] = test_mae.item()
+            
             if val_mse != val_mse:
                 print('Exit due to NaN')
-                return None, None, None, None
+                pickle.dump(epoch_loss, epoch_loss_pkl)
+                epoch_loss_pkl.close()
+                return None, None, None, None, None, None
             
             self.scheduler.step()
             
@@ -206,122 +226,44 @@ class Regression:
 
             if self.best_counter >= self.convergence_epochs:
                 print('Exit due to converged')
-                filename = 'model_best_train_idx_val_' \
-                           + str(self.idx_validation_fold) \
-                           + '_idx_test_' \
-                           + str(self.idx_test_fold) \
-                           + '.pth.tar'
-                torch.save(self.best_state, filename)
-                return self.best_val_mae, self.best_val_mse,\
-                    self.best_test_mae, self.best_test_mse
+                shutil.copyfile('model_best.pth.tar',
+                                'model_best_converged.pth.tar')
+                os.remove('model_best.pth.tar')
+                pickle.dump(epoch_loss, epoch_loss_pkl)
+                epoch_loss_pkl.close()
+                return self.predict()
         
-        return None, None, None, None
+        pickle.dump(epoch_loss, epoch_loss_pkl)
+        epoch_loss_pkl.close()
+        
+        return None, None, None, None, None, None
 
     def predict(self, **kwargs):
         # test best model
-        best_checkpoint = torch.load('model_best_train_idx_val_' \
-                                     + str(self.idx_validation_fold) \
-                                     + '_idx_test_' \
-                                     + str(self.idx_test_fold) \
-                                     + '.pth.tar')
+        best_checkpoint = torch.load('model_best_converged.pth.tar')
         
         self.model.load_state_dict(best_checkpoint['state_dict'])
         
+        if os.path.exists('tinnet_output.db'):
+            os.remove('tinnet_output.db')
+        
         train_mse, train_mae \
-            = self.eval_parm_model('train', self.train_loader, **kwargs)
+            = self.eval_model(catagory='train',
+                              data_loader=self.train_loader,
+                              save_outputs=True,
+                              **kwargs)
         val_mse, val_mae \
-            = self.eval_parm_model('validation', self.val_loader, **kwargs)
+            = self.eval_model(catagory='validation',
+                              data_loader=self.val_loader,
+                              save_outputs=True,
+                              **kwargs)
         test_mse, test_mae \
-            = self.eval_parm_model('test', self.test_loader, **kwargs)
+            = self.eval_model(catagory='test',
+                              data_loader=self.test_loader,
+                              save_outputs=True,
+                              **kwargs)
+        
         return train_mae, train_mse, val_mae, val_mse, test_mae, test_mse
-    
-    def eval_parm_model(self, name, data_loader, **kwargs):
-        batch_time = AverageMeter()
-        losses = AverageMeter()
-        mae_errors = AverageMeter()
-        
-        # switch to evaluate mode
-        self.model.eval()
-        
-        end = time.time()
-        
-        for i, (input, target, batch_cif_ids) in enumerate(data_loader):
-            with torch.no_grad():
-                if self.cuda:
-                    input_var = (Variable(input[0].cuda(non_blocking=True)),
-                                 Variable(input[1].cuda(non_blocking=True)),
-                                 input[2].cuda(non_blocking=True),
-                                 [crys_idx.cuda(non_blocking=True)
-                                  for crys_idx in input[3]])
-                else:
-                    input_var = (Variable(input[0]),
-                                 Variable(input[1]),
-                                 input[2],
-                                 input[3])
-                
-                if self.cuda:
-                    target_var = Variable(target.cuda(non_blocking=True))
-                else:
-                    target_var = Variable(target)
-            
-            # compute output
-            cnn_output = self.model(*input_var)
-            
-            if self.phys_model =='gcnn':
-                output, parm = Chemisorption.gcnn(self,
-                                                  cnn_output,
-                                                  **kwargs)
-            
-            if self.phys_model =='newns_anderson_semi':
-                output, parm = Chemisorption.newns_anderson_semi(
-                    self,
-                    cnn_output,
-                    dos_source='model',
-                    task=self.task,
-                    **dict(**kwargs, batch_cif_ids=batch_cif_ids))
-            
-            if self.phys_model =='user_defined':
-                output, parm = Chemisorption.user_defined(self,
-                                                  cnn_output,
-                                                  **kwargs)
-            
-            loss = self.criterion(output, target_var)*output.shape[-1]
-            
-            # measure accuracy and record loss
-            mae_error = self.mae(output.data,target_var)*output.shape[-1]
-            losses.update(loss.data, target.size(0))
-            mae_errors.update(mae_error, target.size(0))
-            
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-            
-            if i % self.print_freq == 0:
-                print(name + ': [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'
-                      .format(i, len(data_loader),
-                              batch_time=batch_time,
-                              loss=losses,
-                              mae_errors=mae_errors))
-        
-        np.savetxt('parm_' + name + '_idx_val_' \
-                   + str(self.idx_validation_fold) \
-                   + '_idx_test_' \
-                   + str(self.idx_test_fold) \
-                   + '.txt', parm.detach().cpu().numpy())
-        
-        with open(name + '_results_idx_val_' \
-                  + str(self.idx_validation_fold) \
-                  + '_idx_test_' + str(self.idx_test_fold) + '.csv', 'w') as f:
-            writer = csv.writer(f)
-            for cif_id, target, pred in zip(batch_cif_ids, target, output):
-                writer.writerow((cif_id,
-                                 target[0].detach().cpu().numpy(),
-                                 pred[0].detach().cpu().numpy()))
-        
-        return losses.avg, mae_errors.avg
     
     def train_model(self, **kwargs):
         batch_time = AverageMeter()
@@ -368,7 +310,7 @@ class Regression:
                     self,
                     cnn_output,
                     dos_source='dft',
-                    task=self.task,
+                    target=target_var,
                     **dict(**kwargs, batch_cif_ids=batch_cif_ids))
             
             if self.phys_model =='user_defined':
@@ -393,21 +335,20 @@ class Regression:
             batch_time.update(time.time() - end)
             end = time.time()
             
-            if i % self.print_freq == 0:
-                print('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'
-                      .format(self.epoch, i, len(self.train_loader),
-                              batch_time=batch_time,
-                              data_time=data_time,
-                              loss=losses,
-                              mae_errors=mae_errors))
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'
+                  .format(self.epoch, i, len(self.train_loader),
+                          batch_time=batch_time,
+                          data_time=data_time,
+                          loss=losses,
+                          mae_errors=mae_errors))
         
         return losses.avg, mae_errors.avg
     
-    def eval_model(self, name, data_loader, **kwargs):
+    def eval_model(self, catagory, data_loader, save_outputs=False, **kwargs):
         batch_time = AverageMeter()
         losses = AverageMeter()
         mae_errors = AverageMeter()
@@ -449,7 +390,7 @@ class Regression:
                     self,
                     cnn_output,
                     dos_source='model',
-                    task=self.task,
+                    target=target_var,
                     **dict(**kwargs, batch_cif_ids=batch_cif_ids))
             
             if self.phys_model =='user_defined':
@@ -467,21 +408,46 @@ class Regression:
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
-    
-            if i % self.print_freq == 0:
-                print(name + ': [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'
-                      .format(i, len(data_loader),
-                              batch_time=batch_time,
-                              loss=losses,
-                              mae_errors=mae_errors))
+            
+            print(catagory + ': [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'
+                  .format(i, len(data_loader),
+                          batch_time=batch_time,
+                          loss=losses,
+                          mae_errors=mae_errors))
+            
+            if save_outputs:
+                with connect('tinnet_output.db') as db:
+                    for i in range(len(parm)):
+                        p = parm[i]
+                        db.write(self.images[int(p[0].item())],
+                                 catagory = catagory,
+                                 index = p[0].item(),
+                                 dft_ead = p[1].item(),
+                                 dft_d_cen = p[2].item(),
+                                 dft_half_width = p[3].item(),
+                                 ed_hybridization = p[4].item(),
+                                 ed_repusion = p[5].item(),
+                                 model_energy = p[6].item(),
+                                 model_d_cen = p[7].item(),
+                                 model_half_width = p[8].item(),
+                                 adse_1 = p[9].item(),
+                                 beta_1 = p[10].item(),
+                                 delta_1 = p[11].item(),
+                                 adse_2 = p[12].item(),
+                                 beta_2 = p[13].item(),
+                                 delta_2 = p[14].item(),
+                                 adse_3 = p[15].item(),
+                                 beta_3 = p[16].item(),
+                                 delta_3 = p[17].item(),
+                                 alpha = p[18].item(),
+                                 filling = p[19].item(),
+                                 vad2 = p[20].item(),
+                                 esp = self.esp)
         
         return losses.avg, mae_errors.avg
-    
-    def state_dict(self):
-        return self.model.state_dict()
     
     def mae(self, prediction, target):
         '''
@@ -497,18 +463,18 @@ class Regression:
     
     def save_checkpoint(self, state, is_best, **kwargs):
         self.best_counter += 1
+        torch.save(state, 'checkpoint.pth.tar')
         if is_best:
-            self.best_state = deepcopy(state)
-            self.best_val_mse, self.best_val_mae \
-                = self.eval_model('validation', self.val_loader, **kwargs)
-            self.best_test_mse, self.best_test_mae \
-                = self.eval_model('test', self.test_loader, **kwargs)
+            shutil.copyfile('checkpoint.pth.tar', 'model_best.pth.tar')
             self.best_counter = 0
     
     def get_train_val_test_loader(self,
                                   dataset,
-                                  idx_validation_fold=0,
+                                  idx_val_fold=0,
                                   idx_test_fold=None,
+                                  train_ratio=0.9,
+                                  val_ratio=0.1,
+                                  test_ratio=0.0,
                                   collate_fn=default_collate,
                                   batch_size=256,
                                   num_workers=0,
@@ -541,17 +507,25 @@ class Regression:
           DataLoader that random samples the test data.
         '''
         
-        indices = np.arange(len(dataset))
+        assert abs(train_ratio + val_ratio + test_ratio - 1.0) <= 1e-6
         
+        assert (0.0 <= train_ratio <= 1.0
+                and 0.0 <= val_ratio <= 1.0
+                and 0.0 <= test_ratio <= 1.0)
+        
+        indices = np.arange(len(dataset))
+        n = len(indices)
+
+        if random_seed:
+            random.Random(random_seed).shuffle(indices)
+        else:
+            random.shuffle(indices)
+            
         if data_format == 'nested':
-            if random_seed:
-                random.Random(random_seed).shuffle(indices)
-            else:
-                random.shuffle(indices)
             
             kfold = np.array_split(indices,10)
             
-            kfold_val = deepcopy(kfold[idx_validation_fold])
+            kfold_val = deepcopy(kfold[idx_val_fold])
             
             try:
                 kfold_test = deepcopy(kfold[idx_test_fold])
@@ -560,16 +534,12 @@ class Regression:
             
             kfold_train = deepcopy([kfold[i]
                                     for i in range(0,10)
-                                    if i != idx_validation_fold 
+                                    if i != idx_val_fold 
                                        and i != idx_test_fold])
             
             kfold_train = np.array([item for sl in kfold_train for item in sl])
             
         elif data_format == 'regular':
-            if random_seed:
-                random.Random(random_seed).shuffle(indices)
-            else:
-                random.shuffle(indices)
             
             kfold = np.array_split(indices,10)
                 
@@ -584,18 +554,31 @@ class Regression:
             except:
                 kfold_test = []
             
-            kfold_val = deepcopy(kfold[idx_validation_fold])
+            kfold_val = deepcopy(kfold[idx_val_fold])
             
             kfold_train = deepcopy([kfold[i]
                                     for i in range(0,10)
-                                    if i != idx_validation_fold])
+                                    if i != idx_val_fold])
             
             kfold_train = np.array([item for sl in kfold_train for item in sl])
             
+        elif data_format == 'random':
+            section_1 = train_ratio
+            section_2 = section_1 + val_ratio
+            section_3 = section_2 + test_ratio
+            kfold_train, kfold_val, kfold_test, rest = \
+                np.array_split(indices,[int(n*section_1),
+                                        int(n*section_2),
+                                        int(n*section_3)])
+            kfold_train = np.concatenate((kfold_train,rest))
+
         elif data_format == 'test':
+            kfold_train = []
+            kfold_val = []
             kfold_test = deepcopy(indices)
-            kfold_val = deepcopy(indices)
-            kfold_train = deepcopy(indices)
+            
+        else:
+            raise NameError('Only nested, regular, random or test is allowed')
         
         val_sampler = SubsetRandomSampler(deepcopy(kfold_val))
         test_sampler = SubsetRandomSampler(deepcopy(kfold_test))

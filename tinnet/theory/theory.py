@@ -10,17 +10,11 @@ import numpy as np
 
 class Chemisorption:
 
-    def __init__(self, model_name, main_target, task, **kwargs):
+    def __init__(self, model_name, main_target, **kwargs):
         # Initialize the class
         if model_name == 'gcnn':
             self.model_num_input = 1
-            self.num_targets = 1
-            self.main_target = main_target
-            
-            if task == 'train':
-                self.target = np.zeros((main_target.shape[0],self.num_targets))
-            elif task == 'test':
-                self.target = main_target
+            self.target = main_target
             
         if model_name == 'newns_anderson_semi':
             self.model_num_input = 12
@@ -42,77 +36,73 @@ class Chemisorption:
             # ergy for dos
             ergy = np.linspace(emin, emax, num_datapoints)
             
+            # target(s)
             esp = kwargs['constant_1']
+            
+            try:
+                root_lamb = kwargs['constant_2']
+            except:
+                root_lamb = 0.1
+            
             vad2 = kwargs['constant_3']
             
-            if task == 'train':
-                root_lamb = kwargs['constant_2']
+            try:
                 d_cen = kwargs['additional_traget_1']
-                half_width = kwargs['additional_traget_2']
-                dos_ads_3sigma = kwargs['additional_traget_3']
-                dos_ads_1pi = kwargs['additional_traget_4']
-                dos_ads_4sigma = kwargs['additional_traget_5']
-                
-                d_cen = torch.from_numpy(d_cen).type(torch.FloatTensor)
-                half_width = torch.from_numpy(half_width)\
-                              .type(torch.FloatTensor)
-                dos_ads_3sigma = torch.from_numpy(dos_ads_3sigma)\
-                                  .type(torch.FloatTensor)
-                dos_ads_1pi = torch.from_numpy(dos_ads_1pi)\
-                               .type(torch.FloatTensor)
-                dos_ads_4sigma = torch.from_numpy(dos_ads_4sigma)\
-                                  .type(torch.FloatTensor)
-                
-                if cuda:
-                    d_cen = d_cen.cuda()
-                    half_width = half_width.cuda()
-                    dos_ads_3sigma = dos_ads_3sigma.cuda()
-                    dos_ads_1pi = dos_ads_1pi.cuda()
-                    dos_ads_4sigma = dos_ads_4sigma.cuda()
-                    
-                num_targets = 9006
-                
-                self.target = np.zeros((main_target.shape[0],num_targets))
-                
-                self.root_lamb = root_lamb
-                self.d_cen = d_cen
-                self.half_width = half_width
-                self.dos_ads_3sigma = dos_ads_3sigma
-                self.dos_ads_1pi = dos_ads_1pi
-                self.dos_ads_4sigma = dos_ads_4sigma
+            except:
+                d_cen = np.zeros((len(main_target),1))
             
-            elif task == 'test':
-                self.target = main_target
-                
+            try:
+                half_width = kwargs['additional_traget_2']
+            except:
+                half_width = np.zeros((len(main_target),1))
+            
+            try:
+                dos_ads_3sigma = kwargs['additional_traget_3']
+            except:
+                dos_ads_3sigma = np.zeros((len(main_target),num_datapoints))
+            
+            try:
+                dos_ads_1pi = kwargs['additional_traget_4']
+            except:
+                dos_ads_1pi = np.zeros((len(main_target),num_datapoints))
+            
+            try:
+                dos_ads_4sigma = kwargs['additional_traget_5']
+            except:
+                dos_ads_4sigma = np.zeros((len(main_target),num_datapoints))
+            
+            main_target = np.reshape(main_target,(-1,1))
+            d_cen = np.reshape(d_cen,(-1,1))
+            half_width = np.reshape(half_width,(-1,1))
+            
+            self.target = np.hstack((main_target,
+                                     d_cen,
+                                     half_width,
+                                     root_lamb*dos_ads_3sigma,
+                                     root_lamb*dos_ads_1pi,
+                                     root_lamb*dos_ads_4sigma))
+            
             # Initialize the class
             h = torch.FloatTensor(h)
             ergy = torch.FloatTensor(ergy)
             vad2 = torch.from_numpy(vad2).type(torch.FloatTensor)
-            main_target = torch.from_numpy(main_target).type(torch.FloatTensor)
             
             if cuda:
                 h = h.cuda()
                 ergy = ergy.cuda()
                 vad2 = vad2.cuda()
-                main_target = main_target.cuda()
             
             self.h = h
             self.ergy = ergy
-            self.vad2 = vad2
             self.esp = esp
-            self.main_target = main_target
+            self.root_lamb = root_lamb
+            self.vad2 = vad2
             
         if model_name == 'user_defined':
             self.model_num_input = 1
-            self.num_targets = 1
-            self.main_target = main_target
-            
-            if task == 'train':
-                self.target = np.zeros((main_target.shape[0],self.num_targets))
-            elif task == 'test':
-                self.target = main_target
+            self.target = main_target
         
-    def newns_anderson_semi(self, namodel_in, dos_source, task , **kwargs):
+    def newns_anderson_semi(self, namodel_in, dos_source, target, **kwargs):
         
         adse_1 = namodel_in[:,0]
         beta_1 = torch.nn.functional.softplus(namodel_in[:,1])
@@ -129,16 +119,10 @@ class Chemisorption:
         
         idx = kwargs['batch_cif_ids']
         
-        dft_energy = self.main_target[idx]
         vad2 = self.vad2[idx]
-        
-        if task == 'train':
-            dft_d_cen = self.d_cen[idx]
-            dft_half_width = self.half_width[idx]
-            dft_dos_ads_3sigma = self.dos_ads_3sigma[idx]
-            dft_dos_ads_1pi = self.dos_ads_1pi[idx]
-            dft_dos_ads_4sigma = self.dos_ads_4sigma[idx]
-        
+        dft_ead = target[:,0,0]
+        dft_d_cen = target[:,0,1]
+        dft_half_width = target[:,0,2]
         ergy = self.ergy
         
         self.fermi = np.argsort(abs(ergy.detach().cpu().numpy()))[0] + 1
@@ -161,7 +145,7 @@ class Chemisorption:
             dos_d += (torch.trapz(dos_d,ergy)[:,None] <= 1e-10) / len(ergy)
             dos_d = dos_d / torch.trapz(dos_d,ergy)[:,None]
         
-        f = torch.trapz(dos_d[:,0:self.fermi],ergy[0:self.fermi])
+        filling = torch.trapz(dos_d[:,0:self.fermi],ergy[0:self.fermi])
         
         na_1, energy_NA_1, model_dos_ads_3sigma \
             = Chemisorption.NA_Model(self, adse_1, beta_1, delta_1, dos_d,
@@ -175,15 +159,25 @@ class Chemisorption:
             = Chemisorption.NA_Model(self, adse_3, beta_3, delta_3, dos_d,
                                      vad2)
         
-        model_energy = (self.esp
-                        + (energy_NA_1 + 2*(na_1+f)*alpha*beta_1*vad2)
-                        + (energy_NA_2 + 2*(na_2+f)*alpha*beta_2*vad2) * 2
-                        + (energy_NA_3 + 2*(na_3+f)*alpha*beta_3*vad2))
+        ed_hybridization = energy_NA_1 + energy_NA_2 * 2 + energy_NA_3
         
-        idx = torch.from_numpy(np.array(idx, dtype=np.float32)).cuda()
+        ed_repusion = (2*(na_1+filling)*alpha*beta_1*vad2
+                       + 4*(na_2+filling)*alpha*beta_2*vad2
+                       + 2*(na_3+filling)*alpha*beta_3*vad2)
+        
+        model_energy = self.esp + ed_hybridization + ed_repusion
+        
+        if torch.cuda.is_available():
+            idx = torch.from_numpy(np.array(idx, dtype=np.float32)).cuda()
+        else:
+            idx = torch.from_numpy(np.array(idx, dtype=np.float32))
         
         parm = torch.stack((idx,
-                            dft_energy,
+                            dft_ead,
+                            dft_d_cen,
+                            dft_half_width,
+                            ed_hybridization,
+                            ed_repusion,
                             model_energy,
                             model_d_cen,
                             model_half_width,
@@ -196,22 +190,18 @@ class Chemisorption:
                             adse_3,
                             beta_3,
                             delta_3,
-                            alpha)).T
+                            alpha,
+                            filling,
+                            vad2)).T
         
-        if task == 'train':
-            ans = torch.cat(((dft_energy-model_energy).view(-1, 1),
-                             (dft_d_cen-model_d_cen).view(-1, 1),
-                             (dft_half_width-model_half_width).view(-1, 1),
-                             self.root_lamb*(dft_dos_ads_3sigma
-                                             - model_dos_ads_3sigma),
-                             self.root_lamb*(dft_dos_ads_1pi
-                                             - model_dos_ads_1pi),
-                             self.root_lamb*(dft_dos_ads_4sigma
-                                             - model_dos_ads_4sigma)),1)
-            ans = ans.view(len(ans),1,-1)
+        ans = torch.cat((model_energy.view(-1, 1),
+                         model_d_cen.view(-1, 1),
+                         model_half_width.view(-1, 1),
+                         self.root_lamb*model_dos_ads_3sigma,
+                         self.root_lamb*model_dos_ads_1pi,
+                         self.root_lamb*model_dos_ads_4sigma),1)
         
-        elif task == 'test':
-            ans = model_energy.view(len(model_energy),-1)
+        ans = ans.view(len(ans),1,-1)
         
         return ans, parm
     

@@ -3,6 +3,7 @@ from __future__ import print_function, division
 import numpy as np
 
 from ase import io
+from ase.db import connect
 
 from tinnet.regression.regression import Regression
 
@@ -13,39 +14,44 @@ n_conv = 5
 h_fea_len = 174
 n_h = 2
 
+# database
+db = connect('tinnet_OH.db')
+
 # constants
 esp = -2.693696878597913
 root_lamb = 0.1
-vad2 = np.loadtxt('vad2.txt')
+vad2 = np.array([r['data']['vad2'] for r in db.select()])
 
 # images
-images = io.read('OH_Images_Unrelaxed.traj', index=slice(None))
+images = [r.toatoms() for r in db.select()]
 
 # main target
-ead = np.loadtxt('ead.txt')
+ead = np.array([r['ead'] for r in db.select()])
 
 # additional target(s)
-d_cen = np.loadtxt('d_cen.txt')
-half_width = np.loadtxt('half_width.txt')
-dos_ads_3sigma = np.loadtxt('dos_ads_3sigma.txt')
-dos_ads_1pi = np.loadtxt('dos_ads_1pi.txt')
-dos_ads_4sigma = np.loadtxt('dos_ads_4sigma.txt')
+d_cen = np.array([r['data']['d_cen'] for r in db.select()])
+half_width = np.array([r['data']['half_width'] for r in db.select()])
+dos_ads_3sigma = np.array([r['data']['dos_ads_3sigma'] for r in db.select()])
+dos_ads_1pi = np.array([r['data']['dos_ads_1pi'] for r in db.select()])
+dos_ads_4sigma = np.array([r['data']['dos_ads_4sigma'] for r in db.select()])
 
 # indices of validation and test fold 
-idx_validation_fold = 0
+idx_val_fold = 0
 idx_test_fold = 2
 
 # set up model
 model = Regression(images=images,
                    main_target=ead,
-                   task='train',
                    data_format='nested',
                    phys_model='newns_anderson_semi',
                    optim_algorithm='AdamW',
                    batch_size=64,
                    weight_decay=0.0001,
-                   idx_validation_fold=idx_validation_fold,
+                   idx_val_fold=idx_val_fold,
                    idx_test_fold=idx_test_fold,
+                   #train_ratio=1.0,
+                   #val_ratio=0.0,
+                   #test_ratio=0.0,
                    convergence_epochs=1000,
                    
                    # hyperparameter
@@ -67,6 +73,6 @@ model = Regression(images=images,
                    )
 
 # train a model
-val_mae, val_mse, test_mae, test_mse = model.train(25000)
+train_mae, train_mse, val_mae, val_mse, test_mae, test_mse = model.train(25000)
 
-print(val_mae, val_mse, test_mae, test_mse)
+print(train_mae, train_mse, val_mae, val_mse, test_mae, test_mse)
