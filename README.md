@@ -115,6 +115,7 @@ After predicting, you will get six files in 'Main' directory:
 ## Data
 
 To reproduce our paper, you can download the corresponding datasets following the [instruction](Data).
+https://github.com/hlxin/tinnet/tree/master/data
 
 ## Authors
 
