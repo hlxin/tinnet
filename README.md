@@ -30,25 +30,9 @@ The following paper describes the details of the TinNet framework:
 
 ## How to cite
 
-Please cite the following work if you want to use TinNet.
+Please cite the following work for TinNet:
 
-@ARTICLE{Wang2021-ok,
-  title    = "{Infusing theory into deep learning for interpretable reactivity
-              prediction}",
-  author   = "Wang, Shih-Han and Pillai, Hemanth Somarajan and Wang, Siwen and
-              Achenie, Luke E K and Xin, Hongliang",
-  journal  = "Nat. Commun.",
-  volume   =  12,
-  number   =  1,
-  pages    = "5288",
-  month    =  sep,
-  year     =  2021,
-  url      = "http://dx.doi.org/10.1038/s41467-021-25639-8",
-  language = "en",
-  issn     = "2041-1723",
-  pmid     = "34489441",
-  doi      = "10.1038/s41467-021-25639-8"
-}
+Wang, S.-H.; Pillai, H. S.; Wang, S.; Achenie, L. E. K.; Xin, H. Infusing Theory into Deep Learning for Interpretable Reactivity Prediction. Nat. Commun. 2021, 12 (1), 5288. https://doi.org/10.1038/s41467-021-25639-8.
 
 ##  Prerequisites
 
