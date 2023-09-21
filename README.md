@@ -32,7 +32,6 @@ The following paper describes the details of the TinNet framework:
 
 Please cite the following work if you want to use TinNet.
 
-'''
 @ARTICLE{Wang2021-ok,
   title    = "{Infusing theory into deep learning for interpretable reactivity
               prediction}",
@@ -50,8 +49,6 @@ Please cite the following work if you want to use TinNet.
   pmid     = "34489441",
   doi      = "10.1038/s41467-021-25639-8"
 }
-
-'''
 
 ##  Prerequisites
 
