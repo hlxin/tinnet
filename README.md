@@ -55,9 +55,9 @@ Please cite the following work for TinNet:
 
 Wang, S.-H.; Pillai, H. S.; Wang, S.; Achenie, L. E. K.; Xin, H. Infusing Theory into Deep Learning for Interpretable Reactivity Prediction. Nat. Commun. 2021, 12 (1), 5288. https://doi.org/10.1038/s41467-021-25639-8.
 
-Huang, Y., Wang, S.-H., Achenie, L. E., Choudhary, K., & Xin, H. Origin of unique electronic structures of single-atom alloys unraveled by interpretable deep learning. The Journal of Chemical Physics, 2024, 161(16).
+Huang, Y., Wang, S.-H., Achenie, L. E., Choudhary, K., & Xin, H. Origin of unique electronic structures of single-atom alloys unraveled by interpretable deep learning. The Journal of Chemical Physics, 2024, 161(16). https://doi.org/10.1063/5.0232141.
 
-Huang, Y., Wang, S.-H., Kamanuru, M., Achenie, L. E., Kitchin, J. R., & Xin, H. Unifying theory of electronic descriptors of metal surfaces upon perturbation. Physical Review B, 2024, 110(12), L121404.
+Huang, Y., Wang, S.-H., Kamanuru, M., Achenie, L. E., Kitchin, J. R., & Xin, H. Unifying theory of electronic descriptors of metal surfaces upon perturbation. Physical Review B, 2024, 110(12), L121404. https://doi.org/10.1103/PhysRevB.110.L121404.
 
 ##  Prerequisites
 
