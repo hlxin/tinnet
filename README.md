@@ -6,15 +6,15 @@ TinNet (short for Theory Infused Neural Network) is a conceptual framework that 
 
 1. Bridging the Interpretability Gap
 
-Traditional machine learning methods, such as deep neural networks, can yield highly accurate predictions but often act as “black boxes,” providing limited insight into the underlying mechanisms.
+    Traditional machine learning methods, such as deep neural networks, can yield highly accurate predictions but often act as “black boxes,” providing limited insight into the underlying mechanisms.
 
 2. Improving Accuracy
 
-While physics-based models offer solid theoretical grounding and interpretability, they can sometimes struggle to match the predictive accuracy of ML models, especially when dealing with complex or high-dimensional data.
+    While physics-based models offer solid theoretical grounding and interpretability, they can sometimes struggle to match the predictive accuracy of ML models, especially when dealing with complex or high-dimensional data.
 
 3. Better Extrapolation
 
-By leveraging physics-based understanding, TinNet helps guide machine learning models beyond their training domain, mitigating large errors when extrapolating to new parameter spaces.
+    By leveraging physics-based understanding, TinNet helps guide machine learning models beyond their training domain, mitigating large errors when extrapolating to new parameter spaces.
 
 ## Core Concept of TinNet
 
@@ -22,15 +22,15 @@ TinNet is not a single model but a methodological framework. In our research, we
 
 1. Combining CGCNN and the Newns–Anderson Model
 
-Applied to predict and analyze *OH, *O, and *N adsorption energies on $d$-block metal alloys. The Newns–Anderson model provides physical insights into electronic structure and adsorption states.
+    Applied to predict and analyze *OH, *O, and *N adsorption energies on $d$-block metal alloys. The Newns–Anderson model provides physical insights into electronic structure and adsorption states.
 
 2. Combining CGCNN and $d$-band Theory
 
-Used to predict the $d$-band center, an important descriptor for the electronic structure of transition metals and alloys. $d$-band theory underpins our understanding of metal-adsorbate interactions.
+    Used to predict the $d$-band center, an important descriptor for the electronic structure of transition metals and alloys. $d$-band theory underpins our understanding of metal-adsorbate interactions.
 
 3. Combining CGCNN and the Tight-Binding Model
 
-Used to predict higher order moments, allowing for a more comprehensive analysis of electronic structures. The tight-binding model offers a simplified yet insightful perspective on electron propagation in solids.
+    Used to predict higher order moments, allowing for a more comprehensive analysis of electronic structures. The tight-binding model offers a simplified yet insightful perspective on electron propagation in solids.
 
 ## Software package
 
