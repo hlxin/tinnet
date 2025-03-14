@@ -1,5 +1,39 @@
 # Theory Infused Neural Network (TinNet)
 
+TinNet (short for Theory Infused Neural Network) is a conceptual framework that integrates traditional machine learning models with physics-based models. Traditional ML models often lack interpretability, while purely physics-based models can sometimes sacrifice accuracy. By combining the strengths of both, TinNet aims to achieve high accuracy, enhanced interpretability, and improved performance in both interpolation and extrapolation tasks.
+
+## Why TinNet?
+
+1. Bridging the Interpretability Gap
+
+Traditional machine learning methods, such as deep neural networks, can yield highly accurate predictions but often act as “black boxes,” providing limited insight into the underlying mechanisms.
+
+2. Improving Accuracy
+
+While physics-based models offer solid theoretical grounding and interpretability, they can sometimes struggle to match the predictive accuracy of ML models, especially when dealing with complex or high-dimensional data.
+
+3. Better Extrapolation
+
+By leveraging physics-based understanding, TinNet helps guide machine learning models beyond their training domain, mitigating large errors when extrapolating to new parameter spaces.
+
+## Core Concept of TinNet
+
+TinNet is not a single model but a methodological framework. In our research, we integrate CGCNN (Crystal Graph Convolutional Neural Network) with a variety of physics-based models:
+
+1. Combining CGCNN and the Newns–Anderson Model
+
+Applied to predict and analyze *OH, *O, and *N adsorption energies on $d$-block metal alloys. The Newns–Anderson model provides physical insights into electronic structure and adsorption states.
+
+2. Combining CGCNN and $d$-band Theory
+
+Used to predict the $d$-band center, an important descriptor for the electronic structure of transition metals and alloys. $d$-band theory underpins our understanding of metal-adsorbate interactions.
+
+3. Combining CGCNN and the Tight-Binding Model
+
+Used to predict higher order moments, allowing for a more comprehensive analysis of electronic structures. The tight-binding model offers a simplified yet insightful perspective on electron propagation in solids.
+
+## Software package
+
 The TinNet software package is adapted from Crystal Graph Convolutional Neural Networks (CGCNN) codes of Jeffrey C. Grossman and Zachary W. Ulissi.
 - [Crystal Graph Convolutional Neural Networks (CGCNN)](https://link.aps.org/doi/10.1103/PhysRevLett.120.145301).
 - [Tian Xie](https://github.com/txie-93/cgcnn).
@@ -15,24 +49,15 @@ The following paper describes the details of the TinNet framework:
 
 [Infusing Theory into Machine Learning for Interpretable Reactivity Prediction](URL TBD)
 
-## Table of Contents
-
-- [How to cite]
-- [Prerequisites]
-- [Usage]
-  - [Load images and properties]
-  - [Tune hyperparameters]
-  - [Train a TinNet model]
-  - [Predict material properties with a pre-trained TinNet model]
-- [Data]
-- [Authors]
-- [License]
-
 ## How to cite
 
 Please cite the following work for TinNet:
 
 Wang, S.-H.; Pillai, H. S.; Wang, S.; Achenie, L. E. K.; Xin, H. Infusing Theory into Deep Learning for Interpretable Reactivity Prediction. Nat. Commun. 2021, 12 (1), 5288. https://doi.org/10.1038/s41467-021-25639-8.
+
+Huang, Y., Wang, S.-H., Achenie, L. E., Choudhary, K., & Xin, H. Origin of unique electronic structures of single-atom alloys unraveled by interpretable deep learning. The Journal of Chemical Physics, 2024, 161(16).
+
+Huang, Y., Wang, S.-H., Kamanuru, M., Achenie, L. E., Kitchin, J. R., & Xin, H. Unifying theory of electronic descriptors of metal surfaces upon perturbation. Physical Review B, 2024, 110(12), L121404.
 
 ##  Prerequisites
 
@@ -121,4 +146,4 @@ This software was primarily written by [Shih-Han Wang] who was advised by [Prof.
 
 ## License
 
-TinNet is released under the MIT License.
+TinNet is released under the MIT License. Feel free to use and cite it, respecting the specified terms and conditions.
