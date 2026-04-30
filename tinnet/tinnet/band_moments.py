@@ -16,6 +16,17 @@ from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler
 
 
+def _copy_without_adsorbates(image):
+    """Return a copy of an ASE Atoms object with O/H adsorbates removed."""
+    clean_image = image.copy()
+    adsorbate_indices = [
+        i for i, atom in enumerate(clean_image) if atom.symbol in {"O", "H"}
+    ]
+    for i in sorted(adsorbate_indices, reverse=True):
+        del clean_image[i]
+    return clean_image
+
+
 class BandMoments:
     def __init__(self,
                  image=None,
@@ -33,11 +44,20 @@ class BandMoments:
     def predict(self,
                 image=None,
                 return_all_parm=False):
-        input_image = self.image
+        input_image = self.image if image is None else image
         atom_inx = self.atom_inx
         system_name = self.name
+
+        if input_image is None:
+            raise ValueError("image must be provided.")
+        if atom_inx is None:
+            raise ValueError("atom_inx must be provided.")
+
+        input_image = _copy_without_adsorbates(input_image)
+        if atom_inx + 1 > len(input_image):
+            raise IndexError(f"atom_inx={atom_inx} is outside the clean image with {len(input_image)} atoms.")
         
-        images = [input_image, input_image]
+        images = [input_image.copy(), input_image.copy()]
         atom_inx = np.array([atom_inx, atom_inx])
         
         lr = 0.0044485033567158005
@@ -71,13 +91,6 @@ class BandMoments:
         power_gamma_dd = []
     
         for image_idx, (s_idx, image) in enumerate(zip(atom_inx, images)):
-            
-            o_indices = [i for i, atom in enumerate(image) if atom.symbol == 'O']
-            for i in sorted(o_indices, reverse=True):
-                del image[i]
-            h_indices = [i for i, atom in enumerate(image) if atom.symbol == 'H']
-            for i in sorted(h_indices, reverse=True):
-                del image[i]
             
             radius = 8.0
             dmin = 0.0

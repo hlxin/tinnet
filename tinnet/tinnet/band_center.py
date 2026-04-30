@@ -13,6 +13,20 @@ from ase import io
 from pylab import *
 
 
+def _copy_without_adsorbates(image):
+    """Return a copy of an ASE Atoms object with O/H adsorbates removed.
+
+    This avoids mutating the caller's structure during prediction or SHAP analysis.
+    """
+    clean_image = image.copy()
+    adsorbate_indices = [
+        i for i, atom in enumerate(clean_image) if atom.symbol in {"O", "H"}
+    ]
+    for i in sorted(adsorbate_indices, reverse=True):
+        del clean_image[i]
+    return clean_image
+
+
 class BandCenter:
     def __init__(self,
                  image=None,
@@ -30,18 +44,17 @@ class BandCenter:
     def predict(self,
                 return_all_parm=False):
         
-        input_image = self.image
-        
-        o_indices = [i for i, atom in enumerate(input_image) if atom.symbol == 'O']
-        for i in sorted(o_indices, reverse=True):
-            del input_image[i]
-        h_indices = [i for i, atom in enumerate(input_image) if atom.symbol == 'H']
-        for i in sorted(h_indices, reverse=True):
-            del input_image[i]
+        if self.image is None:
+            raise ValueError("image must be provided.")
+        if self.atom_inx is None:
+            raise ValueError("atom_inx must be provided.")
+
+        input_image = _copy_without_adsorbates(self.image)
         
         atom_inx = self.atom_inx
         system_name = self.name
-        assert atom_inx + 1 <= len(input_image)
+        if atom_inx + 1 > len(input_image):
+            raise IndexError(f"atom_inx={atom_inx} is outside the clean image with {len(input_image)} atoms.")
         
         enlarged_image = input_image.copy()
         enlarged_atom_inx = len(enlarged_image)*60 + atom_inx
@@ -321,11 +334,10 @@ class BandCenter:
                           atom_inx,
                           return_all_parm=False):
         
-        oh_indices = [i for i, atom in enumerate(image) if atom.symbol == 'O' or atom.symbol == 'H']
-        for i in sorted(oh_indices, reverse=True):
-            del image[i]
+        image = _copy_without_adsorbates(image)
         
-        assert atom_inx + 1 <= len(image)
+        if atom_inx + 1 > len(image):
+            raise IndexError(f"atom_inx={atom_inx} is outside the clean image with {len(image)} atoms.")
         
         enlarged_image = image.copy()
         enlarged_atom_inx = len(enlarged_image)*60 + atom_inx
@@ -606,11 +618,10 @@ class BandCenter:
                    atom_inx,
                    return_all_parm=False):
         
-        oh_indices = [i for i, atom in enumerate(image) if atom.symbol == 'O' or atom.symbol == 'H']
-        for i in sorted(oh_indices, reverse=True):
-            del image[i]
+        image = _copy_without_adsorbates(image)
         
-        assert atom_inx + 1 <= len(image)
+        if atom_inx + 1 > len(image):
+            raise IndexError(f"atom_inx={atom_inx} is outside the clean image with {len(image)} atoms.")
         
         enlarged_image = image.copy()
         enlarged_atom_inx = len(enlarged_image)*60 + atom_inx

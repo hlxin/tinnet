@@ -29,6 +29,24 @@ from pymatgen.analysis.structure_analyzer import VoronoiConnectivity
 from pymatgen.io.ase import AseAtomsAdaptor
 
 
+def _copy_without_adsorbates(image):
+    """Return a copy of an ASE Atoms object with O/H adsorbates removed."""
+    clean_image = image.copy()
+    adsorbate_indices = [
+        i for i, atom in enumerate(clean_image) if atom.symbol in {"O", "H"}
+    ]
+    for i in sorted(adsorbate_indices, reverse=True):
+        del clean_image[i]
+    return clean_image
+
+def _values_for_symbols(symbols, values, name):
+    """Resolve per-element constants and fail with a clear message if unsupported."""
+    missing = sorted({symbol for symbol in symbols if symbol not in values})
+    if missing:
+        raise KeyError(f"Missing {name} constants for element(s): {', '.join(missing)}")
+    return [values[symbol] for symbol in symbols]
+
+
 class CohesiveEnergy:
     def __init__(self,
                  image=None,
@@ -40,12 +58,14 @@ class CohesiveEnergy:
                 image=None,
                 return_all_parm=False):
         
-        if image is  None:
+        if image is None:
             image = self.image
+        if image is None:
+            raise ValueError("image must be provided.")
         
         name = self.name
         
-        images = [image]
+        images = [_copy_without_adsorbates(image)]
         
         # hyperparameters
         atom_fea_len = 150
@@ -72,10 +92,10 @@ class CohesiveEnergy:
 
         for image in images:
             sym = image.get_chemical_symbols()
-            pe_tmp = [PE_dic[s] for s in sym]
-            pe += [pe_tmp]
-            vws_tmp = [V_dic[s] for s in sym]
-            vws += [vws_tmp]
+            pe_tmp = _values_for_symbols(sym, PE_dic, "promotion energy")
+            pe.append(pe_tmp)
+            vws_tmp = _values_for_symbols(sym, V_dic, "Wigner-Seitz volume")
+            vws.append(vws_tmp)
         
         pe = np.array(pe, dtype=object)
         vws = np.array(vws, dtype=object)
@@ -137,13 +157,8 @@ class CohesiveEnergy:
                  ref_image,
                  target_image):
         
-        oh_indices = [i for i, atom in enumerate(ref_image) if atom.symbol == 'O' or atom.symbol == 'H']
-        for i in sorted(oh_indices, reverse=True):
-            del ref_image[i]
-        
-        oh_indices = [i for i, atom in enumerate(target_image) if atom.symbol == 'O' or atom.symbol == 'H']
-        for i in sorted(oh_indices, reverse=True):
-            del target_image[i]
+        ref_image = _copy_without_adsorbates(ref_image)
+        target_image = _copy_without_adsorbates(target_image)
         
         predicted_parameter_reference = self.predict(ref_image,
                                                      return_all_parm=True)

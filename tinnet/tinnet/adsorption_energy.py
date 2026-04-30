@@ -20,6 +20,19 @@ from .band_center import BandCenter
 
 
 class AdsorptionEnergy:
+    """Predict adsorption energies for supported TinNet adsorption models.
+
+    Notes
+    -----
+    The public API is intentionally kept compatible with the original notebook:
+    ``AdsorptionEnergy(image=..., site_inx=..., adsorbate=...).predict()``.
+    The implementation below avoids mutating the input ASE ``Atoms`` object and
+    consolidates the duplicated OH/O prediction logic.
+    """
+
+    SUPPORTED_ADSORBATES = {"OH", "O"}
+    N_ENSEMBLE_MODELS = 10
+
     def __init__(self,
                  image=None,
                  site_inx=None,
@@ -36,88 +49,146 @@ class AdsorptionEnergy:
                                    dmin=0,
                                    step=0.2,
                                    dict_atom_fea=None)
-    
+        self.phys_model = None
+
+    @staticmethod
+    def _strip_adsorbates(image):
+        """Return a copy of ``image`` with O/H adsorbates removed.
+
+        The original implementation deleted atoms directly from the input
+        structure, which made repeated predictions order-dependent.
+        """
+        clean_image = image.copy()
+        indices = [i for i, atom in enumerate(clean_image)
+                   if atom.symbol in {'O', 'H'}]
+        for idx in sorted(indices, reverse=True):
+            del clean_image[idx]
+        return clean_image
+
+    @staticmethod
+    def _normalize_site_indices(site_inx):
+        if site_inx is None:
+            raise ValueError("site_inx must be provided.")
+        if isinstance(site_inx, np.ndarray):
+            site_inx = site_inx.tolist()
+        elif isinstance(site_inx, (int, np.integer)):
+            site_inx = [int(site_inx)]
+        else:
+            site_inx = list(site_inx)
+        if len(site_inx) != 1:
+            raise NotImplementedError(
+                "Only atop-site adsorption with exactly one site index is currently supported."
+            )
+        return site_inx
+
+    @staticmethod
+    def _build_adsorbed_image(image, site_index, adsorbate):
+        """Return a new ASE image with the requested adsorbate placed atop a site."""
+        ads_image = image.copy()
+        site_position = ads_image.get_positions()[site_index]
+
+        if adsorbate == 'OH':
+            ads_image.append(Atom('O', position=site_position + np.array([0.0, 0.0, 2.00])))
+            ads_image.append(Atom('H', position=site_position + np.array([0.8, 0.0, 2.41])))
+        elif adsorbate == 'O':
+            ads_image.append(Atom('O', position=site_position + np.array([0.0, 0.0, 1.80])))
+        else:
+            raise ValueError(f"Unsupported adsorbate: {adsorbate}")
+
+        return ads_image
+
+    def _get_vad2(self, image, site_inx):
+        symbols = image.get_chemical_symbols()
+        try:
+            return np.array([self.atom_prop_dict[symbols[i]]['vad2']
+                             for i in site_inx], dtype=np.float32)
+        except KeyError as exc:
+            raise KeyError(f"Missing 'vad2' for element {exc.args[0]}") from exc
+
+    def _get_o_atop_band_parameters(self, image, site_index):
+        """Compute d-band center and half width needed by the O-atop model."""
+        band_model = BandCenter(image=image.copy(), atom_inx=site_index)
+
+        d_cen = band_model.image2band_center(image=image.copy(), atom_inx=site_index)
+        d_cen = np.average(d_cen)
+
+        full_width = band_model.image2band_full_rectangular_width(
+            image=image.copy(),
+            atom_inx=site_index,
+        )
+        half_width = np.average(full_width) / np.sqrt(12) * 2.0
+
+        return d_cen, half_width
+
+    def _run_ensemble(self, features, phys_model, site_inx, vad2, **kwargs):
+        results = []
+        for model_inx in range(self.N_ENSEMBLE_MODELS):
+            model = Regression(features=features,
+                               model_inx=model_inx,
+                               vad2=vad2,
+                               site_inx=site_inx,
+                               phys_model=phys_model,
+                               **kwargs)
+            results.append(model.eval_model())
+
+        model_ead, model_parm = zip(*results)
+        return np.stack(model_ead).flatten(), np.stack(model_parm)
+
     def predict(self,
                 image=None,
                 site_inx=None,
                 return_all_parm=False):
-        
-        if image == None:
+        if image is None:
             image = self.image
-        if site_inx == None:
+        if image is None:
+            raise ValueError("image must be provided.")
+
+        if site_inx is None:
             site_inx = self.site_inx
-        
-        oh_indices = [i for i, atom in enumerate(image) if atom.symbol == 'O' or atom.symbol == 'H']
-        for i in sorted(oh_indices, reverse=True):
-            del image[i]
-        
-        # OH atop site
-        if self.adsorbate == 'OH' and len(site_inx) == 1:
-            self.phys_model = 'OH_atop'
-            
-            pos = image.get_positions()[site_inx[0]] + [0.0, 0.0, 2.00]
-            image.append(Atom('O', position = pos))
-            pos = image.get_positions()[site_inx[0]] + [0.8, 0.0, 2.41]
-            image.append(Atom('H', position = pos))
-            
-            vad2 = np.array([self.atom_prop_dict[image.get_chemical_symbols()[i]]['vad2']
-                             for i in site_inx], dtype=np.float32)
-            
-            results = [Regression(features=self.descriptor.feas(image),
-                                  model_inx=model_inx,
-                                  vad2=vad2,
-                                  site_inx=site_inx,
-                                  phys_model=self.phys_model).eval_model()
-                       for model_inx in range(0,10)]
-            
-            model_ead, model_parm = zip(*results)
-            model_ead = np.stack(list(model_ead)).flatten()
-            model_parm = np.stack(list(model_parm))
-            
-            if return_all_parm == False:
-                print(f"The adsorption energy of OH on the atop site (index {site_inx}) of {self.name}: {np.mean(model_ead):.2f} ± {np.std(model_ead):.2f} eV")
-                return model_ead
-            if return_all_parm == True:
-                return model_parm
-        
-        # O atop site
-        if self.adsorbate == 'O' and len(site_inx) == 1:
-            self.phys_model = 'O_atop'
-            
-            model = BandCenter(image=image, atom_inx=site_inx[0])
-            
-            d_cen = model.image2band_center(image=image, atom_inx=site_inx[0])
-            d_cen = np.average(d_cen)
-            
-            full_width = model.image2band_full_rectangular_width(image=image, atom_inx=site_inx[0])
-            half_width = np.average(full_width) / np.sqrt(12) * 2.0
-            
-            pos = image.get_positions()[site_inx[0]] + [0.0, 0.0, 1.8]
-            image.append(Atom('O', position = pos))
-            
-            
-            vad2 = np.array([self.atom_prop_dict[image.get_chemical_symbols()[i]]['vad2']
-                             for i in site_inx], dtype=np.float32)
-            
-            results = [Regression(features=self.descriptor.feas(image),
-                                  model_inx=model_inx,
-                                  vad2=vad2,
-                                  site_inx=site_inx,
-                                  d_cen=d_cen,
-                                  half_width=half_width,
-                                  phys_model=self.phys_model).eval_model()
-                       for model_inx in range(0,10)]
-            
-            model_ead, model_parm = zip(*results)
-            model_ead = np.stack(list(model_ead)).flatten()
-            model_parm = np.stack(list(model_parm))
-            
-            if return_all_parm == False:
-                print(f"The adsorption energy of O on the atop site (index {site_inx}) of {self.name}: {np.mean(model_ead):.2f} ± {np.std(model_ead):.2f} eV")
-                return model_ead
-            if return_all_parm == True:
-                return model_parm
-    
+        site_inx = self._normalize_site_indices(site_inx)
+        site_index = site_inx[0]
+
+        if self.adsorbate not in self.SUPPORTED_ADSORBATES:
+            raise ValueError(
+                f"Unsupported adsorbate: {self.adsorbate}. "
+                f"Supported adsorbates are {sorted(self.SUPPORTED_ADSORBATES)}."
+            )
+
+        clean_image = self._strip_adsorbates(image)
+        if site_index >= len(clean_image):
+            raise IndexError(
+                f"site index {site_index} is out of range for the clean slab "
+                f"with {len(clean_image)} atoms."
+            )
+
+        phys_model = f'{self.adsorbate}_atop'
+        self.phys_model = phys_model  # kept for backward-compatible SHAP methods
+
+        model_kwargs = {}
+        if self.adsorbate == 'O':
+            d_cen, half_width = self._get_o_atop_band_parameters(clean_image, site_index)
+            model_kwargs.update(d_cen=d_cen, half_width=half_width)
+
+        ads_image = self._build_adsorbed_image(clean_image, site_index, self.adsorbate)
+        features = self.descriptor.feas(ads_image)
+        vad2 = self._get_vad2(clean_image, site_inx)
+
+        model_ead, model_parm = self._run_ensemble(features=features,
+                                                   phys_model=phys_model,
+                                                   site_inx=site_inx,
+                                                   vad2=vad2,
+                                                   **model_kwargs)
+
+        if return_all_parm:
+            return model_parm
+
+        print(
+            f"The adsorption energy of {self.adsorbate} on the atop site "
+            f"(index {site_inx}) of {self.name}: "
+            f"{np.mean(model_ead):.2f} ± {np.std(model_ead):.2f} eV"
+        )
+        return model_ead
+
     def gen_shap(self,
                  ref_image,
                  ref_site_inx,
@@ -1153,7 +1224,7 @@ class Regression:
         
         data_sampler = SubsetRandomSampler(np.arange(len(dataset)))
         
-        data_loader = DataLoader(dataset, batch_size=1024,
+        data_loader = DataLoader(dataset, batch_size=batch_size,
                                  sampler=data_sampler,
                                  num_workers=num_workers,
                                  collate_fn=collate_fn,
