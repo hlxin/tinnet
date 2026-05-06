@@ -1,4 +1,9 @@
 #!/usr/bin/env python
+"""TinNet adsorption-energy models for OH/O atop adsorption.
+
+This module keeps the original public API while centralizing common utilities,
+safer checkpoint loading, and non-mutating ASE structure handling.
+"""
 # This script is adapted from Xie's and Ulissi's scripts.
 
 import shap
@@ -8,30 +13,142 @@ import numpy as np
 import torch.nn as nn
 
 from ase import Atom
-from pylab import *
 from pymatgen.analysis.structure_analyzer import VoronoiConnectivity
 from pymatgen.io.ase import AseAtomsAdaptor
-from torch.autograd import Variable
-from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
-from torch.utils.data.sampler import SubsetRandomSampler
 
-from .band_center import BandCenter
+try:
+    from .band_center import BandCenter
+except ImportError:  # Allows running this file directly during debugging.
+    from band_center import BandCenter
+
+try:
+    from .tinnet_utils import (
+        atom_features,
+        as_float_tensor,
+        adsorption_atom_properties,
+        as_long_tensor,
+        copy_without_adsorbates,
+        data_path,
+        load_checkpoint_state,
+        signed_label,
+        signed_color,
+        save_figure,
+        move_tensor_sequence,
+        make_data_loader,
+        normalize_atom_index,
+        normalize_site_indices,
+        pretrained_path,
+        set_publication_style,
+        stack_scalar_parameters,
+        torch_device,
+        validate_atom_index,
+        values_for_symbols,
+    )
+except ImportError:  # Allows running this file directly during debugging.
+    from tinnet_utils import (
+        atom_features,
+        as_float_tensor,
+        adsorption_atom_properties,
+        as_long_tensor,
+        copy_without_adsorbates,
+        data_path,
+        load_checkpoint_state,
+        signed_label,
+        signed_color,
+        save_figure,
+        move_tensor_sequence,
+        make_data_loader,
+        normalize_atom_index,
+        normalize_site_indices,
+        pretrained_path,
+        set_publication_style,
+        stack_scalar_parameters,
+        torch_device,
+        validate_atom_index,
+        values_for_symbols,
+    )
 
 
 class AdsorptionEnergy:
-    """Predict adsorption energies for supported TinNet adsorption models.
+    """Predict OH/O atop adsorption energies with TinNet.
 
-    Notes
-    -----
-    The public API is intentionally kept compatible with the original notebook:
-    ``AdsorptionEnergy(image=..., site_inx=..., adsorbate=...).predict()``.
-    The implementation below avoids mutating the input ASE ``Atoms`` object and
-    consolidates the duplicated OH/O prediction logic.
+    The implementation is configuration driven: adsorbate-specific metadata
+    (parameter names, SHAP labels, orbital degeneracies, and plot labels) lives
+    in one place and is reused by prediction, SHAP analysis, the Newns-Anderson
+    post-hoc energy function, and plotting. This avoids separate OH/O code paths
+    that can silently diverge over time.
     """
 
-    SUPPORTED_ADSORBATES = {"OH", "O"}
     N_ENSEMBLE_MODELS = 10
+
+    MODEL_SPECS = {
+        'OH': {
+            'phys_model': 'OH_atop',
+            'adsorbate_geometry': (
+                ('O', np.array([0.0, 0.0, 2.00])),
+                ('H', np.array([0.8, 0.0, 2.41])),
+            ),
+            'energy_label': r'$E_{ad}^{OH, top}$ (eV)',
+            'feature_labels': [
+                r'$V_{ad}^{2}$',
+                r'$\epsilon_{d}$',
+                r'$W_{d}$',
+                r'$\epsilon_{3\sigma}$',
+                r'$\beta_{3\sigma}$',
+                r'$\delta_{3\sigma}$',
+                r'$\epsilon_{1\pi}$',
+                r'$\beta_{1\pi}$',
+                r'$\delta_{1\pi}$',
+                r'$\epsilon_{4\sigma^{*}}$',
+                r'$\beta_{4\sigma^{*}}$',
+                r'$\delta_{4\sigma^{*}}$',
+            ],
+            # Columns in return_all_parm after the first energy column.
+            'parameter_columns': (
+                'vad2', 'd_cen', 'width',
+                'adse_1', 'beta_1', 'delta_1',
+                'adse_2', 'beta_2', 'delta_2',
+                'adse_3', 'beta_3', 'delta_3',
+            ),
+            # Adsorbate orbital blocks in the parameter matrix.
+            # (adse column, beta column, delta column, degeneracy, alpha)
+            'orbital_blocks': (
+                (3, 4, 5, 1, 0.06378761202273762),
+                (6, 7, 8, 2, 0.06378761202273762),
+                (9, 10, 11, 1, 0.06378761202273762),
+            ),
+            'esp': -2.693696878597913,
+        },
+        'O': {
+            'phys_model': 'O_atop',
+            'adsorbate_geometry': (
+                ('O', np.array([0.0, 0.0, 1.80])),
+            ),
+            'energy_label': r'$E_{ad}^{O, top}$ (eV)',
+            'feature_labels': [
+                r'$V_{ad}^{2}$',
+                r'$\epsilon_{d}$',
+                r'$W_{d}$',
+                r'$\epsilon_{pz}$',
+                r'$\beta_{pz}$',
+                r'$\delta_{pz}$',
+                r'$\epsilon_{pxy}$',
+                r'$\beta_{pxy}$',
+                r'$\delta_{pxy}$',
+            ],
+            'parameter_columns': (
+                'vad2', 'd_cen', 'width',
+                'adse_2', 'beta_2', 'delta_2',
+                'adse_3', 'beta_3', 'delta_3',
+            ),
+            'orbital_blocks': (
+                (3, 4, 5, 1, 0.07889181751783157),
+                (6, 7, 8, 2, 0.05687347683456299),
+            ),
+            'esp': -3.765294246337454,
+        },
+    }
 
     def __init__(self,
                  image=None,
@@ -42,8 +159,8 @@ class AdsorptionEnergy:
         self.site_inx = site_inx
         self.adsorbate = adsorbate
         self.name = name
-        self.atom_fea_dict = Features.dict_atom_fea_default(self)
-        self.atom_prop_dict = Features.dict_atom_prop_default(self)
+        self.atom_fea_dict = atom_features()
+        self.atom_prop_dict = adsorption_atom_properties()
         self.descriptor = Features(max_num_nbr=12,
                                    radius=8,
                                    dmin=0,
@@ -51,76 +168,76 @@ class AdsorptionEnergy:
                                    dict_atom_fea=None)
         self.phys_model = None
 
-    @staticmethod
-    def _strip_adsorbates(image):
-        """Return a copy of ``image`` with O/H adsorbates removed.
+    @classmethod
+    def _spec_for(cls, adsorbate=None, phys_model=None):
+        """Return adsorbate metadata from either adsorbate name or physical-model name."""
+        if adsorbate is None and phys_model is not None:
+            for candidate, spec in cls.MODEL_SPECS.items():
+                if spec['phys_model'] == phys_model:
+                    return candidate, spec
+            raise ValueError(f"Unsupported physical model: {phys_model}")
 
-        The original implementation deleted atoms directly from the input
-        structure, which made repeated predictions order-dependent.
-        """
-        clean_image = image.copy()
-        indices = [i for i, atom in enumerate(clean_image)
-                   if atom.symbol in {'O', 'H'}]
-        for idx in sorted(indices, reverse=True):
-            del clean_image[idx]
-        return clean_image
+        if adsorbate not in cls.MODEL_SPECS:
+            supported = ', '.join(sorted(cls.MODEL_SPECS))
+            raise ValueError(f"Unsupported adsorbate '{adsorbate}'. Supported adsorbates: {supported}.")
+        return adsorbate, cls.MODEL_SPECS[adsorbate]
 
-    @staticmethod
-    def _normalize_site_indices(site_inx):
-        if site_inx is None:
-            raise ValueError("site_inx must be provided.")
-        if isinstance(site_inx, np.ndarray):
-            site_inx = site_inx.tolist()
-        elif isinstance(site_inx, (int, np.integer)):
-            site_inx = [int(site_inx)]
-        else:
-            site_inx = list(site_inx)
+    def _spec(self, adsorbate=None, phys_model=None):
+        """Return adsorbate metadata for this predictor instance."""
+        adsorbate = self.adsorbate if adsorbate is None and phys_model is None else adsorbate
+        return self._spec_for(adsorbate=adsorbate, phys_model=phys_model)
+
+    def _resolve_prediction_inputs(self, image=None, site_inx=None):
+        """Normalize user inputs and return a clean slab plus one atop index."""
+        image = self.image if image is None else image
+        if image is None:
+            raise ValueError("image must be provided.")
+
+        site_inx = self.site_inx if site_inx is None else site_inx
+        site_inx = normalize_site_indices(site_inx)
         if len(site_inx) != 1:
             raise NotImplementedError(
-                "Only atop-site adsorption with exactly one site index is currently supported."
+                "Only atop adsorption with exactly one site index is currently supported."
             )
-        return site_inx
+
+        clean_image = copy_without_adsorbates(image)
+        validate_atom_index(clean_image, site_inx[0], label="site_inx")
+        return clean_image, site_inx
 
     @staticmethod
-    def _build_adsorbed_image(image, site_index, adsorbate):
-        """Return a new ASE image with the requested adsorbate placed atop a site."""
-        ads_image = image.copy()
+    def _build_adsorbed_image(clean_image, site_index, adsorbate_geometry):
+        """Return a new ASE image with the adsorbate placed above the atop site."""
+        ads_image = clean_image.copy()
         site_position = ads_image.get_positions()[site_index]
-
-        if adsorbate == 'OH':
-            ads_image.append(Atom('O', position=site_position + np.array([0.0, 0.0, 2.00])))
-            ads_image.append(Atom('H', position=site_position + np.array([0.8, 0.0, 2.41])))
-        elif adsorbate == 'O':
-            ads_image.append(Atom('O', position=site_position + np.array([0.0, 0.0, 1.80])))
-        else:
-            raise ValueError(f"Unsupported adsorbate: {adsorbate}")
-
+        for symbol, offset in adsorbate_geometry:
+            ads_image.append(Atom(symbol, position=site_position + offset))
         return ads_image
 
-    def _get_vad2(self, image, site_inx):
-        symbols = image.get_chemical_symbols()
-        try:
-            return np.array([self.atom_prop_dict[symbols[i]]['vad2']
-                             for i in site_inx], dtype=np.float32)
-        except KeyError as exc:
-            raise KeyError(f"Missing 'vad2' for element {exc.args[0]}") from exc
-
-    def _get_o_atop_band_parameters(self, image, site_index):
-        """Compute d-band center and half width needed by the O-atop model."""
-        band_model = BandCenter(image=image.copy(), atom_inx=site_index)
-
-        d_cen = band_model.image2band_center(image=image.copy(), atom_inx=site_index)
-        d_cen = np.average(d_cen)
-
-        full_width = band_model.image2band_full_rectangular_width(
-            image=image.copy(),
-            atom_inx=site_index,
+    def _site_vad2(self, clean_image, site_inx):
+        symbols = clean_image.get_chemical_symbols()
+        return np.array(
+            values_for_symbols([symbols[i] for i in site_inx],
+                               {k: v['vad2'] for k, v in self.atom_prop_dict.items()},
+                               'vad2'),
+            dtype=np.float32,
         )
-        half_width = np.average(full_width) / np.sqrt(12) * 2.0
 
+    @staticmethod
+    def _band_parameters_for_o_atop(clean_image, site_index):
+        """Compute d-band center and rectangular half-width required by O-atop."""
+        band_model = BandCenter(image=clean_image.copy(), atom_inx=site_index)
+        d_cen = np.average(band_model.image2band_center(image=clean_image.copy(),
+                                                        atom_inx=site_index))
+        full_width = np.average(
+            band_model.image2band_full_rectangular_width(image=clean_image.copy(),
+                                                         atom_inx=site_index)
+        )
+        half_width = full_width / np.sqrt(12) * 2.0
         return d_cen, half_width
 
-    def _run_ensemble(self, features, phys_model, site_inx, vad2, **kwargs):
+    def _run_ensemble(self, *, features, phys_model, site_inx, vad2, model_kwargs=None):
+        """Evaluate all pretrained ensemble members and return stacked outputs."""
+        model_kwargs = {} if model_kwargs is None else dict(model_kwargs)
         results = []
         for model_inx in range(self.N_ENSEMBLE_MODELS):
             model = Regression(features=features,
@@ -128,7 +245,7 @@ class AdsorptionEnergy:
                                vad2=vad2,
                                site_inx=site_inx,
                                phys_model=phys_model,
-                               **kwargs)
+                               **model_kwargs)
             results.append(model.eval_model())
 
         model_ead, model_parm = zip(*results)
@@ -138,909 +255,287 @@ class AdsorptionEnergy:
                 image=None,
                 site_inx=None,
                 return_all_parm=False):
-        if image is None:
-            image = self.image
-        if image is None:
-            raise ValueError("image must be provided.")
-
-        if site_inx is None:
-            site_inx = self.site_inx
-        site_inx = self._normalize_site_indices(site_inx)
+        """Predict adsorption energy for the configured atop adsorbate."""
+        adsorbate, spec = self._spec()
+        clean_image, site_inx = self._resolve_prediction_inputs(image, site_inx)
         site_index = site_inx[0]
-
-        if self.adsorbate not in self.SUPPORTED_ADSORBATES:
-            raise ValueError(
-                f"Unsupported adsorbate: {self.adsorbate}. "
-                f"Supported adsorbates are {sorted(self.SUPPORTED_ADSORBATES)}."
-            )
-
-        clean_image = self._strip_adsorbates(image)
-        if site_index >= len(clean_image):
-            raise IndexError(
-                f"site index {site_index} is out of range for the clean slab "
-                f"with {len(clean_image)} atoms."
-            )
-
-        phys_model = f'{self.adsorbate}_atop'
-        self.phys_model = phys_model  # kept for backward-compatible SHAP methods
+        self.phys_model = spec['phys_model']
 
         model_kwargs = {}
-        if self.adsorbate == 'O':
-            d_cen, half_width = self._get_o_atop_band_parameters(clean_image, site_index)
+        if adsorbate == 'O':
+            d_cen, half_width = self._band_parameters_for_o_atop(clean_image, site_index)
             model_kwargs.update(d_cen=d_cen, half_width=half_width)
 
-        ads_image = self._build_adsorbed_image(clean_image, site_index, self.adsorbate)
+        ads_image = self._build_adsorbed_image(clean_image,
+                                               site_index,
+                                               spec['adsorbate_geometry'])
         features = self.descriptor.feas(ads_image)
-        vad2 = self._get_vad2(clean_image, site_inx)
+        vad2 = self._site_vad2(clean_image, site_inx)
 
         model_ead, model_parm = self._run_ensemble(features=features,
-                                                   phys_model=phys_model,
+                                                   phys_model=spec['phys_model'],
                                                    site_inx=site_inx,
                                                    vad2=vad2,
-                                                   **model_kwargs)
+                                                   model_kwargs=model_kwargs)
 
         if return_all_parm:
             return model_parm
 
         print(
-            f"The adsorption energy of {self.adsorbate} on the atop site "
+            f"The adsorption energy of {adsorbate} on the atop site "
             f"(index {site_inx}) of {self.name}: "
             f"{np.mean(model_ead):.2f} ± {np.std(model_ead):.2f} eV"
         )
         return model_ead
+
+    def _ensemble_shap_matrix(self, predicted_ref, predicted_target):
+        """Compute SHAP rows for all ensemble members with one generic loop."""
+        shap_rows = []
+        ref_energy = []
+        target_energy = []
+
+        for ref_params, target_params in zip(predicted_ref, predicted_target):
+            ref_params = np.asarray(ref_params)
+            target_params = np.asarray(target_params)
+            explainer = shap.Explainer(self.tinnet_ead, np.atleast_2d(ref_params[1:]))
+            shap_values = explainer(np.atleast_2d(target_params[1:])).values
+
+            ref_energy.append(ref_params[0])
+            target_energy.append(target_params[0])
+            shap_rows.append(np.asarray(shap_values).reshape(-1))
+
+        return np.vstack((
+            np.asarray(ref_energy).reshape(1, -1),
+            np.asarray(target_energy).reshape(1, -1),
+            np.asarray(shap_rows).T,
+        ))
 
     def gen_shap(self,
                  ref_image,
                  ref_site_inx,
                  target_image,
                  target_site_inx):
+        """Return ensemble SHAP contributions and mean parameter differences."""
         predicted_parameter_ref = self.predict(ref_image,
                                                ref_site_inx,
                                                return_all_parm=True)
-        
         predicted_parameter_target = self.predict(target_image,
                                                   target_site_inx,
                                                   return_all_parm=True)
-        parm_diff = np.average(predicted_parameter_target, axis=0) - np.average(predicted_parameter_ref, axis=0)
-        
-        if self.phys_model == 'OH_atop':
-            shap_vad2 = []
-            shap_d_cen = []
-            shap_width = []
-            shap_adse_1 = []
-            shap_beta_1 = []
-            shap_delta_1 = []
-            shap_adse_2 = []
-            shap_beta_2 = []
-            shap_delta_2 = []
-            shap_adse_3 = []
-            shap_beta_3 = []
-            shap_delta_3 = []
-            
-            predicted_d_cen_ref = []
-            predicted_d_cen_target = []
-            
-            for i in range(0,10):
-                
-                inp_shap_ref = np.atleast_2d(predicted_parameter_ref[i][1:])
-                
-                explainer = shap.Explainer(self.tinnet_ead,
-                                           inp_shap_ref)
-                
-                inp_shap_target = np.atleast_2d(predicted_parameter_target[i][1:])
-                
-                shap_values = explainer(inp_shap_target).values
-                
-                shap_vad2 += [shap_values[:,0]]
-                shap_d_cen += [shap_values[:,1]]
-                shap_width += [shap_values[:,2]]
-                shap_adse_1 += [shap_values[:,3]]
-                shap_beta_1 += [shap_values[:,4]]
-                shap_delta_1 += [shap_values[:,5]]
-                shap_adse_2 += [shap_values[:,6]]
-                shap_beta_2 += [shap_values[:,7]]
-                shap_delta_2 += [shap_values[:,8]]
-                shap_adse_3 += [shap_values[:,9]]
-                shap_beta_3 += [shap_values[:,10]]
-                shap_delta_3 += [shap_values[:,11]]
-                
-                predicted_d_cen_ref += [predicted_parameter_ref[i][0]]
-                predicted_d_cen_target += [predicted_parameter_target[i][0]]
-            
-            return np.vstack((np.array(predicted_d_cen_ref).flatten(),
-                              np.array(predicted_d_cen_target).flatten(),
-                              np.array(shap_vad2).flatten(),
-                              np.array(shap_d_cen).flatten(),
-                              np.array(shap_width).flatten(),
-                              np.array(shap_adse_1).flatten(),
-                              np.array(shap_beta_1).flatten(),
-                              np.array(shap_delta_1).flatten(),
-                              np.array(shap_adse_2).flatten(),
-                              np.array(shap_beta_2).flatten(),
-                              np.array(shap_delta_2).flatten(),
-                              np.array(shap_adse_3).flatten(),
-                              np.array(shap_beta_3).flatten(),
-                              np.array(shap_delta_3).flatten())), parm_diff
-        if self.phys_model == 'O_atop':
-            shap_vad2 = []
-            shap_d_cen = []
-            shap_width = []
-            shap_adse_2 = []
-            shap_beta_2 = []
-            shap_delta_2 = []
-            shap_adse_3 = []
-            shap_beta_3 = []
-            shap_delta_3 = []
-            
-            predicted_d_cen_ref = []
-            predicted_d_cen_target = []
-            
-            for i in range(0,10):
-                
-                inp_shap_ref = np.atleast_2d(predicted_parameter_ref[i][1:])
-                
-                explainer = shap.Explainer(self.tinnet_ead,
-                                           inp_shap_ref)
-                
-                inp_shap_target = np.atleast_2d(predicted_parameter_target[i][1:])
-                
-                shap_values = explainer(inp_shap_target).values
-                
-                shap_vad2 += [shap_values[:,0]]
-                shap_d_cen += [shap_values[:,1]]
-                shap_width += [shap_values[:,2]]
-                shap_adse_2 += [shap_values[:,3]]
-                shap_beta_2 += [shap_values[:,4]]
-                shap_delta_2 += [shap_values[:,5]]
-                shap_adse_3 += [shap_values[:,6]]
-                shap_beta_3 += [shap_values[:,7]]
-                shap_delta_3 += [shap_values[:,8]]
-                
-                predicted_d_cen_ref += [predicted_parameter_ref[i][0]]
-                predicted_d_cen_target += [predicted_parameter_target[i][0]]
-            
-            return np.vstack((np.array(predicted_d_cen_ref).flatten(),
-                              np.array(predicted_d_cen_target).flatten(),
-                              np.array(shap_vad2).flatten(),
-                              np.array(shap_d_cen).flatten(),
-                              np.array(shap_width).flatten(),
-                              np.array(shap_adse_2).flatten(),
-                              np.array(shap_beta_2).flatten(),
-                              np.array(shap_delta_2).flatten(),
-                              np.array(shap_adse_3).flatten(),
-                              np.array(shap_beta_3).flatten(),
-                              np.array(shap_delta_3).flatten())), parm_diff
-    def tinnet_ead(self,
-                   parm):
-        parm = torch.Tensor(parm)
-        
-        h = np.zeros(3001)
-        if 3001 % 2 == 0:
-            h[0] = h[3001 // 2] = 1
-            h[1:3001 // 2] = 2
+        parm_diff = (np.average(predicted_parameter_target, axis=0)
+                     - np.average(predicted_parameter_ref, axis=0))
+        return self._ensemble_shap_matrix(predicted_parameter_ref,
+                                          predicted_parameter_target), parm_diff
+
+    @staticmethod
+    def _hilbert_multiplier(n_grid, *, dtype, device):
+        """Return the FFT multiplier used for the Hilbert transform."""
+        h = torch.zeros(n_grid, dtype=dtype, device=device)
+        if n_grid % 2 == 0:
+            h[0] = 1
+            h[n_grid // 2] = 1
+            h[1:n_grid // 2] = 2
         else:
             h[0] = 1
-            h[1:(3001+1) // 2] = 2
-        
-        h = torch.Tensor(h)
-        ergy = torch.Tensor(np.linspace(-15, 15, 3001))
-        
-        fermi = np.argsort(abs(ergy))[0] + 1
-        
-        if self.phys_model == 'OH_atop':
-            vad2 = parm[:,0]
-            d_cen = parm[:,1]
-            width = parm[:,2]
-            adse_1 = parm[:,3]
-            beta_1 = parm[:,4]
-            delta_1 = parm[:,5]
-            adse_2 = parm[:,6]
-            beta_2 = parm[:,7]
-            delta_2 = parm[:,8]
-            adse_3 = parm[:,9]
-            beta_3 = parm[:,10]
-            delta_3 = parm[:,11]
-            
-            # Semi-ellipse
-            dos_d = (abs(1-((ergy[None,:]-d_cen[:,None])/width[:,None])**2))**0.5
-            dos_d = dos_d * (abs(ergy[None,:]-d_cen[:,None]) < width[:,None])
-            dos_d = dos_d + (torch.trapz(dos_d,ergy)[:,None] <= 1e-10) / len(ergy)
-            dos_d = dos_d / torch.trapz(dos_d,ergy)[:,None]
-            
-            f = torch.trapz(dos_d[:,0:fermi],ergy[0:fermi])
-            
-            wdos_1 = np.pi * (beta_1[:,None]*vad2[:,None]*dos_d) + delta_1[:,None]
-            wdos_1_ = np.pi * (0*vad2[:,None]*dos_d) + delta_1[:,None]
-            wdos_2 = np.pi * (beta_2[:,None]*vad2[:,None]*dos_d) + delta_2[:,None]
-            wdos_2_ = np.pi * (0*vad2[:,None]*dos_d) + delta_2[:,None]
-            wdos_3 = np.pi * (beta_3[:,None]*vad2[:,None]*dos_d) + delta_3[:,None]
-            wdos_3_ = np.pi * (0*vad2[:,None]*dos_d) + delta_3[:,None]
-            
-            eps = np.finfo(float).eps
-            
-            # Hilbert transform
-            af_1 = torch.fft.fft(wdos_1, dim=1)
-            htwdos_1 = torch.imag(torch.fft.ifft(af_1*h[None,:]))
-            deno_1 = (ergy[None,:] - adse_1[:,None] - htwdos_1)
-            deno_1 = deno_1 * (torch.abs(deno_1) > eps) + eps * (torch.abs(deno_1) <= eps) * (deno_1 >= 0) - eps * (torch.abs(deno_1) <= eps) * (deno_1 < 0)
-            integrand_1 = wdos_1 / deno_1
-            arctan_1 = torch.atan(integrand_1)
-            arctan_1 = (arctan_1-np.pi)*(arctan_1 > 0) + (arctan_1)*(arctan_1 <= 0)
-            d_hyb_1 = 2 / np.pi * torch.trapz(arctan_1[:,0:fermi],ergy[None,0:fermi])
-            
-            lorentzian_1 = (1/np.pi) * (delta_1[:,None])/((ergy[None,:] - adse_1[:,None])**2 + delta_1[:,None]**2)
-            na_1 = torch.trapz(lorentzian_1[:,0:fermi], ergy[None,0:fermi])
-            
-            deno_1_ = (ergy[None,:] - adse_1[:,None])
-            deno_1_ = deno_1_ * (torch.abs(deno_1_) > eps) + eps * (torch.abs(deno_1_) <= eps) * (deno_1_ >= 0) - eps * (torch.abs(deno_1_) <= eps) * (deno_1_ < 0)
-            integrand_1_ = wdos_1_ / deno_1_
-            arctan_1_ = torch.atan(integrand_1_)
-            arctan_1_ = (arctan_1_-np.pi)*(arctan_1_ > 0) + (arctan_1_)*(arctan_1_ <= 0)
-            d_hyb_1_ = 2 / np.pi * torch.trapz(arctan_1_[:,0:fermi],ergy[None,0:fermi])
-            
-            energy_NA_1 = d_hyb_1 - d_hyb_1_
-            
-            dos_ads_1 = wdos_1/(deno_1**2+wdos_1**2)/np.pi
-            dos_ads_1 = dos_ads_1/torch.trapz(dos_ads_1, ergy[None,:])[:,None]
-            
-            af_2 = torch.fft.fft(wdos_2, dim=1)
-            htwdos_2 = torch.imag(torch.fft.ifft(af_2*h[None,:]))
-            deno_2 = (ergy[None,:] - adse_2[:,None] - htwdos_2)
-            deno_2 = deno_2 * (torch.abs(deno_2) > eps) + eps * (torch.abs(deno_2) <= eps) * (deno_2 >= 0) - eps * (torch.abs(deno_2) <= eps) * (deno_2 < 0)
-            integrand_2 = wdos_2 / deno_2
-            arctan_2 = torch.atan(integrand_2)
-            arctan_2 = (arctan_2-np.pi)*(arctan_2 > 0) + (arctan_2)*(arctan_2 <= 0)
-            d_hyb_2 = 2 / np.pi * torch.trapz(arctan_2[:,0:fermi],ergy[None,0:fermi])
-            
-            lorentzian_2 = (1/np.pi) * (delta_2[:,None])/((ergy[None,:] - adse_2[:,None])**2 + delta_2[:,None]**2)
-            na_2 = torch.trapz(lorentzian_2[:,0:fermi], ergy[None,0:fermi])
-            
-            deno_2_ = (ergy[None,:] - adse_2[:,None])
-            deno_2_ = deno_2_ * (torch.abs(deno_2_) > eps) + eps * (torch.abs(deno_2_) <= eps) * (deno_2_ >= 0) - eps * (torch.abs(deno_2_) <= eps) * (deno_2_ < 0)
-            integrand_2_ = wdos_2_ / deno_2_
-            arctan_2_ = torch.atan(integrand_2_)
-            arctan_2_ = (arctan_2_-np.pi)*(arctan_2_ > 0) + (arctan_2_)*(arctan_2_ <= 0)
-            d_hyb_2_ = 2 / np.pi * torch.trapz(arctan_2_[:,0:fermi],ergy[None,0:fermi])
-            
-            energy_NA_2 = d_hyb_2 - d_hyb_2_
-            
-            dos_ads_2 = wdos_2/(deno_2**2+wdos_2**2)/np.pi
-            dos_ads_2 = dos_ads_2/torch.trapz(dos_ads_2, ergy[None,:])[:,None]
-            
-            af_3 = torch.fft.fft(wdos_3, dim=1)
-            htwdos_3 = torch.imag(torch.fft.ifft(af_3*h[None,:]))
-            deno_3 = (ergy[None,:] - adse_3[:,None] - htwdos_3)
-            deno_3 = deno_3 * (torch.abs(deno_3) > eps) + eps * (torch.abs(deno_3) <= eps) * (deno_3 >= 0) - eps * (torch.abs(deno_3) <= eps) * (deno_3 < 0)
-            integrand_3 = wdos_3 / deno_3
-            arctan_3 = torch.atan(integrand_3)
-            arctan_3 = (arctan_3-np.pi)*(arctan_3 > 0) + (arctan_3)*(arctan_3 <= 0)
-            d_hyb_3 = 2 / np.pi * torch.trapz(arctan_3[:,0:fermi],ergy[None,0:fermi])
-            
-            lorentzian_3 = (1/np.pi) * (delta_3[:,None])/((ergy[None,:] - adse_3[:,None])**2 + delta_3[:,None]**2)
-            na_3 = torch.trapz(lorentzian_3[:,0:fermi], ergy[None,0:fermi])
-            
-            deno_3_ = (ergy[None,:] - adse_3[:,None])
-            deno_3_ = deno_3_ * (torch.abs(deno_3_) > eps) + eps * (torch.abs(deno_3_) <= eps) * (deno_3_ >= 0) - eps * (torch.abs(deno_3_) <= eps) * (deno_3_ < 0)
-            integrand_3_ = wdos_3_ / deno_3_
-            arctan_3_ = torch.atan(integrand_3_)
-            arctan_3_ = (arctan_3_-np.pi)*(arctan_3_ > 0) + (arctan_3_)*(arctan_3_ <= 0)
-            d_hyb_3_ = 2 / np.pi * torch.trapz(arctan_3_[:,0:fermi],ergy[None,0:fermi])
-            
-            energy_NA_3 = d_hyb_3 - d_hyb_3_
-            
-            dos_ads_3 = wdos_3/(deno_3**2+wdos_3**2)/np.pi
-            dos_ads_3 = dos_ads_3/torch.trapz(dos_ads_3, ergy[None,:])[:,None]
-            
-            esp = -2.693696878597913
-            alpha = 0.06378761202273762
-            
-            energy = (esp
-                      + (energy_NA_1 + 2*(na_1+f)*alpha*beta_1*vad2)
-                      + (energy_NA_2 + 2*(na_2+f)*alpha*beta_2*vad2) * 2
-                      + (energy_NA_3 + 2*(na_3+f)*alpha*beta_3*vad2))
-            
-            return np.atleast_1d(energy.detach().cpu().numpy())
-            
-        if self.phys_model == 'O_atop':
-            vad2 = parm[:,0]
-            d_cen = parm[:,1]
-            width = parm[:,2]
-            adse_2 = parm[:,3]
-            beta_2 = parm[:,4]
-            delta_2 = parm[:,5]
-            adse_3 = parm[:,6]
-            beta_3 = parm[:,7]
-            delta_3 = parm[:,8]
-            
-            # Semi-ellipse
-            dos_d = (abs(1-((ergy[None,:]-d_cen[:,None])/width[:,None])**2))**0.5
-            dos_d = dos_d * (abs(ergy[None,:]-d_cen[:,None]) < width[:,None])
-            dos_d = dos_d + (torch.trapz(dos_d,ergy)[:,None] <= 1e-10) / len(ergy)
-            dos_d = dos_d / torch.trapz(dos_d,ergy)[:,None]
-            
-            f = torch.trapz(dos_d[:,0:fermi],ergy[0:fermi])
-            
-            wdos_2 = np.pi * (beta_2[:,None]*vad2[:,None]*dos_d) + delta_2[:,None]
-            wdos_2_ = np.pi * (0*vad2[:,None]*dos_d) + delta_2[:,None]
-            wdos_3 = np.pi * (beta_3[:,None]*vad2[:,None]*dos_d) + delta_3[:,None]
-            wdos_3_ = np.pi * (0*vad2[:,None]*dos_d) + delta_3[:,None]
-            
-            eps = np.finfo(float).eps
-            
-            # Hilbert transform
-            af_2 = torch.fft.fft(wdos_2, dim=1)
-            htwdos_2 = torch.imag(torch.fft.ifft(af_2*h[None,:]))
-            deno_2 = (ergy[None,:] - adse_2[:,None] - htwdos_2)
-            deno_2 = deno_2 * (torch.abs(deno_2) > eps) + eps * (torch.abs(deno_2) <= eps) * (deno_2 >= 0) - eps * (torch.abs(deno_2) <= eps) * (deno_2 < 0)
-            integrand_2 = wdos_2 / deno_2
-            arctan_2 = torch.atan(integrand_2)
-            arctan_2 = (arctan_2-np.pi)*(arctan_2 > 0) + (arctan_2)*(arctan_2 <= 0)
-            d_hyb_2 = 2 / np.pi * torch.trapz(arctan_2[:,0:fermi],ergy[None,0:fermi])
-            
-            lorentzian_2 = (1/np.pi) * (delta_2[:,None])/((ergy[None,:] - adse_2[:,None])**2 + delta_2[:,None]**2)
-            na_2 = torch.trapz(lorentzian_2[:,0:fermi], ergy[None,0:fermi])
-            
-            deno_2_ = (ergy[None,:] - adse_2[:,None])
-            deno_2_ = deno_2_ * (torch.abs(deno_2_) > eps) + eps * (torch.abs(deno_2_) <= eps) * (deno_2_ >= 0) - eps * (torch.abs(deno_2_) <= eps) * (deno_2_ < 0)
-            integrand_2_ = wdos_2_ / deno_2_
-            arctan_2_ = torch.atan(integrand_2_)
-            arctan_2_ = (arctan_2_-np.pi)*(arctan_2_ > 0) + (arctan_2_)*(arctan_2_ <= 0)
-            d_hyb_2_ = 2 / np.pi * torch.trapz(arctan_2_[:,0:fermi],ergy[None,0:fermi])
-            
-            energy_NA_2 = d_hyb_2 - d_hyb_2_
-            
-            dos_ads_2 = wdos_2/(deno_2**2+wdos_2**2)/np.pi
-            dos_ads_2 = dos_ads_2/torch.trapz(dos_ads_2, ergy[None,:])[:,None]
-            
-            af_3 = torch.fft.fft(wdos_3, dim=1)
-            htwdos_3 = torch.imag(torch.fft.ifft(af_3*h[None,:]))
-            deno_3 = (ergy[None,:] - adse_3[:,None] - htwdos_3)
-            deno_3 = deno_3 * (torch.abs(deno_3) > eps) + eps * (torch.abs(deno_3) <= eps) * (deno_3 >= 0) - eps * (torch.abs(deno_3) <= eps) * (deno_3 < 0)
-            integrand_3 = wdos_3 / deno_3
-            arctan_3 = torch.atan(integrand_3)
-            arctan_3 = (arctan_3-np.pi)*(arctan_3 > 0) + (arctan_3)*(arctan_3 <= 0)
-            d_hyb_3 = 2 / np.pi * torch.trapz(arctan_3[:,0:fermi],ergy[None,0:fermi])
-            
-            lorentzian_3 = (1/np.pi) * (delta_3[:,None])/((ergy[None,:] - adse_3[:,None])**2 + delta_3[:,None]**2)
-            na_3 = torch.trapz(lorentzian_3[:,0:fermi], ergy[None,0:fermi])
-            
-            deno_3_ = (ergy[None,:] - adse_3[:,None])
-            deno_3_ = deno_3_ * (torch.abs(deno_3_) > eps) + eps * (torch.abs(deno_3_) <= eps) * (deno_3_ >= 0) - eps * (torch.abs(deno_3_) <= eps) * (deno_3_ < 0)
-            integrand_3_ = wdos_3_ / deno_3_
-            arctan_3_ = torch.atan(integrand_3_)
-            arctan_3_ = (arctan_3_-np.pi)*(arctan_3_ > 0) + (arctan_3_)*(arctan_3_ <= 0)
-            d_hyb_3_ = 2 / np.pi * torch.trapz(arctan_3_[:,0:fermi],ergy[None,0:fermi])
-            
-            energy_NA_3 = d_hyb_3 - d_hyb_3_
-            
-            dos_ads_3 = wdos_3/(deno_3**2+wdos_3**2)/np.pi
-            dos_ads_3 = dos_ads_3/torch.trapz(dos_ads_3, ergy[None,:])[:,None]
-            
-            esp = -3.765294246337454
-            alpha_2 = 0.07889181751783157
-            alpha_3 = 0.05687347683456299
-            
-            energy = (esp
-                      + (energy_NA_2 + 2*(na_2+f)*alpha_2*beta_2*vad2)
-                      + (energy_NA_3 + 2*(na_3+f)*alpha_3*beta_3*vad2) * 2)
-            
-            return np.atleast_1d(energy.detach().cpu().numpy())
-        
+            h[1:(n_grid + 1) // 2] = 2
+        return h
+
+    @staticmethod
+    def _safe_denominator(value, eps):
+        """Avoid singular denominators while preserving the original sign rule."""
+        small = torch.abs(value) <= eps
+        return (value * (~small)
+                + eps * small * (value >= 0)
+                - eps * small * (value < 0))
+
+    @staticmethod
+    def _semi_ellipse_dos_batch(ergy, d_cen, width):
+        """Build a normalized semi-elliptic d-DOS for a batch of sites."""
+        dos_d = torch.abs(1 - ((ergy[None, :] - d_cen[:, None]) / width[:, None]) ** 2) ** 0.5
+        dos_d = dos_d * (torch.abs(ergy[None, :] - d_cen[:, None]) < width[:, None])
+        area = torch.trapz(dos_d, ergy, dim=1)
+        dos_d = dos_d + (area[:, None] <= 1e-10) / len(ergy)
+        return dos_d / torch.trapz(dos_d, ergy, dim=1)[:, None]
+
+    def _newns_orbital_terms_batch(self, *, ergy, h, fermi, vad2, dos_d,
+                                   adse, beta, delta, eps):
+        """Evaluate one adsorbate frontier orbital for a batch of parameter sets."""
+        wdos = np.pi * (beta[:, None] * vad2[:, None] * dos_d) + delta[:, None]
+        wdos_reference = np.pi * (0 * vad2[:, None] * dos_d) + delta[:, None]
+
+        htwdos = torch.imag(torch.fft.ifft(torch.fft.fft(wdos, dim=1) * h[None, :], dim=1))
+        denominator = self._safe_denominator(ergy[None, :] - adse[:, None] - htwdos, eps)
+        arctan = torch.atan(wdos / denominator)
+        arctan = (arctan - np.pi) * (arctan > 0) + arctan * (arctan <= 0)
+        d_hyb = 2 / np.pi * torch.trapz(arctan[:, :fermi], ergy[:fermi], dim=1)
+
+        lorentzian = (1 / np.pi) * delta[:, None] / ((ergy[None, :] - adse[:, None]) ** 2 + delta[:, None] ** 2)
+        na = torch.trapz(lorentzian[:, :fermi], ergy[:fermi], dim=1)
+
+        denominator_ref = self._safe_denominator(ergy[None, :] - adse[:, None], eps)
+        arctan_ref = torch.atan(wdos_reference / denominator_ref)
+        arctan_ref = ((arctan_ref - np.pi) * (arctan_ref > 0)
+                      + arctan_ref * (arctan_ref <= 0))
+        d_hyb_ref = 2 / np.pi * torch.trapz(arctan_ref[:, :fermi], ergy[:fermi], dim=1)
+        return d_hyb - d_hyb_ref, na
+
+    def tinnet_ead(self, parm):
+        """Vectorized Newns-Anderson adsorption-energy function for SHAP."""
+        if self.phys_model is None:
+            raise RuntimeError("phys_model is not set. Run predict() before SHAP analysis.")
+        _, spec = self._spec(phys_model=self.phys_model)
+
+        parm = torch.as_tensor(parm, dtype=torch.float32)
+        ergy = torch.linspace(-15, 15, 3001, dtype=parm.dtype, device=parm.device)
+        h = self._hilbert_multiplier(len(ergy), dtype=parm.dtype, device=parm.device)
+        fermi = int(torch.argmin(torch.abs(ergy)).item()) + 1
+        eps = np.finfo(float).eps
+
+        vad2 = parm[:, 0]
+        d_cen = parm[:, 1]
+        width = parm[:, 2]
+        dos_d = self._semi_ellipse_dos_batch(ergy, d_cen, width)
+        filling = torch.trapz(dos_d[:, :fermi], ergy[:fermi], dim=1)
+
+        energy = torch.full_like(vad2, float(spec['esp']))
+        for adse_col, beta_col, delta_col, degeneracy, alpha in spec['orbital_blocks']:
+            energy_na, occupancy = self._newns_orbital_terms_batch(
+                ergy=ergy,
+                h=h,
+                fermi=fermi,
+                vad2=vad2,
+                dos_d=dos_d,
+                adse=parm[:, adse_col],
+                beta=parm[:, beta_col],
+                delta=parm[:, delta_col],
+                eps=eps,
+            )
+            energy = energy + degeneracy * (energy_na + 2 * (occupancy + filling) * alpha * parm[:, beta_col] * vad2)
+
+        return np.atleast_1d(energy.detach().cpu().numpy())
+
+    _signed_color = staticmethod(signed_color)
+    _signed_label = staticmethod(signed_label)
+
+    def _prepare_shap_waterfall_data(self, shap_values, parm_diff):
+        """Sort SHAP features and compute the waterfall start positions."""
+        feature_values = np.asarray(shap_values[2:], dtype=float)
+        order = np.argsort(feature_values)
+        feature_values = feature_values[order]
+        parm_values = np.asarray(parm_diff[1:], dtype=float)[order]
+        labels = [self._spec(phys_model=self.phys_model)[1]['feature_labels'][i] for i in order]
+
+        start_energy = float(shap_values[0])
+        end_energy = float(shap_values[1])
+        starts = start_energy + np.r_[0.0, np.cumsum(feature_values[:-1])]
+        final_energy = starts[-1] + feature_values[-1]
+        y_positions = np.arange(len(feature_values), 0, -1)
+        return labels, feature_values, parm_values, starts, y_positions, start_energy, final_energy, end_energy
+
+    def _draw_shap_waterfall(self, ax, *, labels, feature_values, parm_values,
+                             starts, y_positions, start_energy, final_energy,
+                             ref_name, target_name):
+        """Draw the adsorption-energy SHAP waterfall with one loop."""
+        for start, contribution, parameter_delta, y in zip(starts, feature_values, parm_values, y_positions):
+            color = self._signed_color(contribution)
+            ax.arrow(x=start,
+                     y=y,
+                     dx=contribution,
+                     dy=0,
+                     color=color,
+                     width=1.0 / 3.0,
+                     head_width=1.0 / 3.0,
+                     head_length=0.15 * abs(contribution),
+                     length_includes_head=True)
+            ax.annotate(self._signed_label(contribution),
+                        xy=(1.12, y),
+                        xycoords=('axes fraction', 'data'),
+                        ha='center',
+                        va='center',
+                        color=color)
+            ax.annotate(self._signed_label(parameter_delta),
+                        xy=(-0.12, y),
+                        xycoords=('axes fraction', 'data'),
+                        ha='center',
+                        va='center',
+                        color=self._signed_color(parameter_delta))
+
+        for i, x in enumerate(starts):
+            if i == 0:
+                ax.plot([x, x], [len(y_positions) + 1, 0.5], '--', color='gray', linewidth=1)
+            else:
+                y_upper = y_positions[i - 1] - 1.0 / 3.0
+                y_lower = y_positions[i] + 1.0 / 3.0
+                ax.plot([x, x], [y_lower, y_upper], '--', color='gray', linewidth=1)
+
+        ax.plot([final_energy, final_energy], [len(y_positions) + 1, 0.5], '--', color='orange', linewidth=1)
+        ax.set_ylim([0.5, len(y_positions) + 0.5])
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(labels)
+        ax.set_xlabel(self._spec(phys_model=self.phys_model)[1]['energy_label'])
+        ax.spines[['left', 'right', 'top']].set_visible(False)
+        ax.tick_params('y', length=0, width=0, which='major')
+        ax.annotate(f"{ref_name}\n{start_energy:.2f}",
+                    xy=(start_energy, 1.15),
+                    xycoords=('data', 'axes fraction'),
+                    ha='center',
+                    va='center',
+                    color='gray')
+        ax.annotate(f"{target_name}\n{final_energy:.2f}",
+                    xy=(final_energy, 1.05),
+                    xycoords=('data', 'axes fraction'),
+                    ha='center',
+                    va='center',
+                    color='orange')
+        ax.annotate('SHAP',
+                    xy=(1.12, 1.05),
+                    xycoords=('axes fraction', 'axes fraction'),
+                    ha='center',
+                    va='center',
+                    color='black')
+
     def explain_shap(self,
                      ref_image=None,
                      ref_site_inx=None,
                      ref_name='Reference',
                      plot_name='shap',
                      save_fig='png'):
-        
+        """Generate a compact SHAP waterfall plot for adsorption energy."""
+        if ref_image is None:
+            raise ValueError("ref_image must be provided for SHAP explanation.")
+        if ref_site_inx is None:
+            raise ValueError("ref_site_inx must be provided for SHAP explanation.")
+        if self.image is None or self.site_inx is None:
+            raise ValueError("target image and site_inx must be stored on the AdsorptionEnergy object.")
+
         target_image = self.image
         target_site_inx = self.site_inx
         target_name = self.name
-        
-        rcParams['ps.useafm'] = True
-        plt.rc('font',**{'family':'sans-serif','sans-serif':['DejaVu Sans']})
-        rcParams['pdf.fonttype'] = 42
-        rcParams['errorbar.capsize'] = 4.0
-        mpl.rcParams['ytick.major.width'] = 0.5
-        mpl.rcParams['ytick.minor.width'] = 0.5
-        mpl.rcParams['xtick.major.width'] = 0.5
-        mpl.rcParams['xtick.minor.width'] = 0.5
-        matplotlib.rc('xtick.major', size=4)
-        matplotlib.rc('xtick.minor', size=2)
-        matplotlib.rc('ytick.major', size=4)
-        matplotlib.rc('ytick.minor', size=2)
-        matplotlib.rc('lines', linewidth = 0.5)
-        matplotlib.rc('lines', markeredgewidth=0.5)
-        matplotlib.rc('font', size=7)
-        plt.rcParams['axes.linewidth'] = 0.5
-        
+        set_publication_style()
+
+        shap_values, parm_diff = self.gen_shap(ref_image,
+                                               ref_site_inx,
+                                               target_image,
+                                               target_site_inx)
+        shap_mean = np.average(shap_values, axis=1)
+        plot_data = self._prepare_shap_waterfall_data(shap_mean, parm_diff)
+
         fig, ax = plt.subplots()
-        fig.set_size_inches(3.375*2.0, 3.375)
-        
-        shap, parm_diff = self.gen_shap(ref_image,
-                                        ref_site_inx,
-                                        target_image,
-                                        target_site_inx)
-        
-        shap = np.average(shap, axis=1)
-        
-        idx = np.argsort(shap[2:])
-        
-        parm_diff = parm_diff[1:]
-        
-        if self.phys_model == 'OH_atop':
-            labels = [r'$V_{ad}^{2}$',
-                      r'$\epsilon_{d}$',
-                      r'$W_{d}$',
-                      r'$\epsilon_{3\sigma}$',
-                      r'$\beta_{3\sigma}$',
-                      r'$\delta_{3\sigma}$',
-                      r'$\epsilon_{1\pi}$',
-                      r'$\beta_{1\pi}$',
-                      r'$\delta_{1\pi}$',
-                      r'$\epsilon_{4\sigma^{*}}$',
-                      r'$\beta_{4\sigma^{*}}$',
-                      r'$\delta_{4\sigma^{*}}$']
-            
-            labels = [labels[i] for i in idx]
-            
-            parm_diff = parm_diff[idx]
-            
-            idx = np.concatenate(([0,1], idx+2))
-            shap = shap[idx]
-            
-            dx12 = shap[2]
-            dx11 = shap[3]
-            dx10 = shap[4]
-            dx9 = shap[5]
-            dx8 = shap[6]
-            dx7 = shap[7]
-            dx6 = shap[8]
-            dx5 = shap[9]
-            dx4 = shap[10]
-            dx3 = shap[11]
-            dx2 = shap[12]
-            dx1 = shap[13]
-            
-            x12 = shap[0]
-            x11 = x12 + dx12
-            x10 = x11 + dx11
-            x9 = x10 + dx10
-            x8 = x9 + dx9
-            x7 = x8 + dx8
-            x6 = x7 + dx7
-            x5 = x6 + dx6
-            x4 = x5 + dx5
-            x3 = x4 + dx4
-            x2 = x3 + dx3
-            x1 = x2 + dx2
-            
-            c12 = (shap[2] < 0) * 'red' + (shap[2] >= 0) * 'blue'
-            c11 = (shap[3] < 0) * 'red' + (shap[3] >= 0) * 'blue'
-            c10 = (shap[4] < 0) * 'red' + (shap[4] >= 0) * 'blue'
-            c9 = (shap[5] < 0) * 'red' + (shap[5] >= 0) * 'blue'
-            c8 = (shap[6] < 0) * 'red' + (shap[6] >= 0) * 'blue'
-            c7 = (shap[7] < 0) * 'red' + (shap[7] >= 0) * 'blue'
-            c6 = (shap[8] < 0) * 'red' + (shap[8] >= 0) * 'blue'
-            c5 = (shap[9] < 0) * 'red' + (shap[9] >= 0) * 'blue'
-            c4 = (shap[10] < 0) * 'red' + (shap[10] >= 0) * 'blue'
-            c3 = (shap[11] < 0) * 'red' + (shap[11] >= 0) * 'blue'
-            c2 = (shap[12] < 0) * 'red' + (shap[12] >= 0) * 'blue'
-            c1 = (shap[13] < 0) * 'red' + (shap[13] >= 0) * 'blue'
-            
-            ax.arrow(x=x12, y=12, dx=dx12, dy=0, color=c12, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx12),
-                     length_includes_head=True)
-            ax.arrow(x=x11, y=11, dx=dx11, dy=0, color=c11, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx11),
-                     length_includes_head=True)
-            ax.arrow(x=x10, y=10, dx=dx10, dy=0, color=c10, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx10),
-                     length_includes_head=True)
-            ax.arrow(x=x9, y=9, dx=dx9, dy=0, color=c9, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx9),
-                     length_includes_head=True)
-            ax.arrow(x=x8, y=8, dx=dx8, dy=0, color=c8, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx8),
-                     length_includes_head=True)
-            ax.arrow(x=x7, y=7, dx=dx7, dy=0, color=c7, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx7),
-                     length_includes_head=True)
-            ax.arrow(x=x6, y=6, dx=dx6, dy=0, color=c6, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx6),
-                     length_includes_head=True)
-            ax.arrow(x=x5, y=5, dx=dx5, dy=0, color=c5, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx5),
-                     length_includes_head=True)
-            ax.arrow(x=x4, y=4, dx=dx4, dy=0, color=c4, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx4),
-                     length_includes_head=True)
-            ax.arrow(x=x3, y=3, dx=dx3, dy=0, color=c3, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx3),
-                     length_includes_head=True)
-            ax.arrow(x=x2, y=2, dx=dx2, dy=0, color=c2, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx2),
-                     length_includes_head=True)
-            ax.arrow(x=x1, y=1, dx=dx1, dy=0, color=c1, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx1),
-                     length_includes_head=True)
-            
-            ax.set_ylim([0.5, 12.5])
-            
-            plt.yticks([12,11,10,9,8,7,6,5,4,3,2,1], labels)
-            
-            sym_12 = (shap[2] < 0) * '-' + (shap[2] >= 0) * '+'
-            sym_11 = (shap[3] < 0) * '-' + (shap[3] >= 0) * '+'
-            sym_10 = (shap[4] < 0) * '-' + (shap[4] >= 0) * '+'
-            sym_9 = (shap[5] < 0) * '-' + (shap[5] >= 0) * '+'
-            sym_8 = (shap[6] < 0) * '-' + (shap[6] >= 0) * '+'
-            sym_7 = (shap[7] < 0) * '-' + (shap[7] >= 0) * '+'
-            sym_6 = (shap[8] < 0) * '-' + (shap[8] >= 0) * '+'
-            sym_5 = (shap[9] < 0) * '-' + (shap[9] >= 0) * '+'
-            sym_4 = (shap[10] < 0) * '-' + (shap[10] >= 0) * '+'
-            sym_3 = (shap[11] < 0) * '-' + (shap[11] >= 0) * '+'
-            sym_2 = (shap[12] < 0) * '-' + (shap[12] >= 0) * '+'
-            sym_1 = (shap[13] < 0) * '-' + (shap[13] >= 0) * '+'
-            
-            ax.annotate(sym_12 + '{:.2f}'.format(round(np.abs(shap[2]), 4)),
-                        xy=(1.12, 12.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c12)
-            ax.annotate(sym_11 + '{:.2f}'.format(round(np.abs(shap[3]), 4)),
-                        xy=(1.12, 11.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c11)
-            ax.annotate(sym_10 + '{:.2f}'.format(round(np.abs(shap[4]), 4)),
-                        xy=(1.12, 10.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c10)
-            ax.annotate(sym_9 + '{:.2f}'.format(round(np.abs(shap[5]), 4)),
-                        xy=(1.12, 9.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c9)
-            ax.annotate(sym_8 + '{:.2f}'.format(round(np.abs(shap[6]), 4)),
-                        xy=(1.12, 8.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c8)
-            ax.annotate(sym_7 + '{:.2f}'.format(round(np.abs(shap[7]), 4)),
-                        xy=(1.12, 7.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c7)
-            ax.annotate(sym_6 + '{:.2f}'.format(round(np.abs(shap[8]), 4)),
-                        xy=(1.12, 6.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c6)
-            ax.annotate(sym_5 + '{:.2f}'.format(round(np.abs(shap[9]), 4)),
-                        xy=(1.12, 5.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c5)
-            ax.annotate(sym_4 + '{:.2f}'.format(round(np.abs(shap[10]), 4)),
-                        xy=(1.12, 4.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c4)
-            ax.annotate(sym_3 + '{:.2f}'.format(round(np.abs(shap[11]), 4)),
-                        xy=(1.12, 3.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c3)
-            ax.annotate(sym_2 + '{:.2f}'.format(round(np.abs(shap[12]), 4)),
-                        xy=(1.12, 2.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c2)
-            ax.annotate(sym_1 + '{:.2f}'.format(round(np.abs(shap[13]), 4)),
-                        xy=(1.12, 1.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c1)
-            
-            c12 = (parm_diff[0] < 0) * 'red' + (parm_diff[0] >= 0) * 'blue'
-            c11 = (parm_diff[1] < 0) * 'red' + (parm_diff[1] >= 0) * 'blue'
-            c10 = (parm_diff[2] < 0) * 'red' + (parm_diff[2] >= 0) * 'blue'
-            c9 = (parm_diff[3] < 0) * 'red' + (parm_diff[3] >= 0) * 'blue'
-            c8 = (parm_diff[4] < 0) * 'red' + (parm_diff[4] >= 0) * 'blue'
-            c7 = (parm_diff[5] < 0) * 'red' + (parm_diff[5] >= 0) * 'blue'
-            c6 = (parm_diff[6] < 0) * 'red' + (parm_diff[6] >= 0) * 'blue'
-            c5 = (parm_diff[7] < 0) * 'red' + (parm_diff[7] >= 0) * 'blue'
-            c4 = (parm_diff[8] < 0) * 'red' + (parm_diff[8] >= 0) * 'blue'
-            c3 = (parm_diff[9] < 0) * 'red' + (parm_diff[9] >= 0) * 'blue'
-            c2 = (parm_diff[10] < 0) * 'red' + (parm_diff[10] >= 0) * 'blue'
-            c1 = (parm_diff[11] < 0) * 'red' + (parm_diff[11] >= 0) * 'blue'
-            
-            sym_12 = (parm_diff[0] < 0) * '-' + (parm_diff[0] >= 0) * '+'
-            sym_11 = (parm_diff[1] < 0) * '-' + (parm_diff[1] >= 0) * '+'
-            sym_10 = (parm_diff[2] < 0) * '-' + (parm_diff[2] >= 0) * '+'
-            sym_9 = (parm_diff[3] < 0) * '-' + (parm_diff[3] >= 0) * '+'
-            sym_8 = (parm_diff[4] < 0) * '-' + (parm_diff[4] >= 0) * '+'
-            sym_7 = (parm_diff[5] < 0) * '-' + (parm_diff[5] >= 0) * '+'
-            sym_6 = (parm_diff[6] < 0) * '-' + (parm_diff[6] >= 0) * '+'
-            sym_5 = (parm_diff[7] < 0) * '-' + (parm_diff[7] >= 0) * '+'
-            sym_4 = (parm_diff[8] < 0) * '-' + (parm_diff[8] >= 0) * '+'
-            sym_3 = (parm_diff[9] < 0) * '-' + (parm_diff[9] >= 0) * '+'
-            sym_2 = (parm_diff[10] < 0) * '-' + (parm_diff[10] >= 0) * '+'
-            sym_1 = (parm_diff[11] < 0) * '-' + (parm_diff[11] >= 0) * '+'
-            
-            ax.annotate(sym_12 + '{:.2f}'.format(round(np.abs(parm_diff[0]), 4)),
-                        xy=(-0.12, 12.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c12)
-            ax.annotate(sym_11 + '{:.2f}'.format(round(np.abs(parm_diff[1]), 4)),
-                        xy=(-0.12, 11.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c11)
-            ax.annotate(sym_10 + '{:.2f}'.format(round(np.abs(parm_diff[2]), 4)),
-                        xy=(-0.12, 10.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c10)
-            ax.annotate(sym_9 + '{:.2f}'.format(round(np.abs(parm_diff[3]), 4)),
-                        xy=(-0.12, 9.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c9)
-            ax.annotate(sym_8 + '{:.2f}'.format(round(np.abs(parm_diff[4]), 4)),
-                        xy=(-0.12, 8.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c8)
-            ax.annotate(sym_7 + '{:.2f}'.format(round(np.abs(parm_diff[5]), 4)),
-                        xy=(-0.12, 7.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c7)
-            ax.annotate(sym_6 + '{:.2f}'.format(round(np.abs(parm_diff[6]), 4)),
-                        xy=(-0.12, 6.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c6)
-            ax.annotate(sym_5 + '{:.2f}'.format(round(np.abs(parm_diff[7]), 4)),
-                        xy=(-0.12, 5.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c5)
-            ax.annotate(sym_4 + '{:.2f}'.format(round(np.abs(parm_diff[8]), 4)),
-                        xy=(-0.12, 4.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c4)
-            ax.annotate(sym_3 + '{:.2f}'.format(round(np.abs(parm_diff[9]), 4)),
-                        xy=(-0.12, 3.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c3)
-            ax.annotate(sym_2 + '{:.2f}'.format(round(np.abs(parm_diff[10]), 4)),
-                        xy=(-0.12, 2.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c2)
-            ax.annotate(sym_1 + '{:.2f}'.format(round(np.abs(parm_diff[11]), 4)),
-                        xy=(-0.12, 1.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c1)
-            
-            ax.set_xlabel(r'$E_{ad}^{OH, top}$ (eV)')
-            ax.spines[['left', 'right', 'top']].set_visible(False)
-            
-            ax.tick_params('y', length=0, width=0, which='major')
-            
-            ax.plot([x12, x12],[13, 0.5],'--', color='gray', linewidth=1)
-            ax.plot([x11, x11], [12 + 1.0 / 3.0, 11 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x10, x10], [11 + 1.0 / 3.0, 10 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x9, x9], [10 + 1.0 / 3.0, 9 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x8, x8], [9 + 1.0 / 3.0, 8 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x7, x7], [8 + 1.0 / 3.0, 7 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x6, x6], [7 + 1.0 / 3.0, 6 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x5, x5], [6 + 1.0 / 3.0, 5 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x4, x4], [5 + 1.0 / 3.0, 4 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x3, x3], [4 + 1.0 / 3.0, 3 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x2, x2], [3 + 1.0 / 3.0, 2 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x1, x1], [2 + 1.0 / 3.0, 1 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            
-            ax.plot([x1 + dx1, x1 + dx1],[14, 0.5],'--', color='orange',
-                    linewidth=1)
-            
-            ax.annotate(ref_name + '\n{:.2f}'.format(round(x12, 4)),
-                        xy=(x12, 1.15), xycoords=('data', 'axes fraction'),
-                        ha='center', va='center', color='gray')
-            ax.annotate(target_name + '\n{:.2f}'.format(round(x1 + dx1, 4)),
-                        xy=(x1 + dx1, 1.05), xycoords=('data', 'axes fraction'),
-                        ha='center', va='center', color='orange')
-            
-            ax.annotate('SHAP',
-                        xy=(1.12, 1.05), xycoords=('axes fraction', 'axes fraction'),
-                        ha='center', va='center', color='black')
-            
-            fig.tight_layout()
-            
-            if save_fig == 'png':
-                fig.savefig(plot_name + '.png', bbox_inches='tight', dpi=600)
-            elif save_fig == 'pdf':
-                fig.savefig(plot_name + '.pdf', bbox_inches='tight')
-        if self.phys_model == 'O_atop':
-            labels = [r'$V_{ad}^{2}$',
-                      r'$\epsilon_{d}$',
-                      r'$W_{d}$',
-                      r'$\epsilon_{pz}$',
-                      r'$\beta_{pz}$',
-                      r'$\delta_{pz}$',
-                      r'$\epsilon_{pxy}$',
-                      r'$\beta_{pxy}$',
-                      r'$\delta_{pxy}$']
-            
-            labels = [labels[i] for i in idx]
-            
-            parm_diff = parm_diff[idx]
-            
-            idx = np.concatenate(([0,1], idx+2))
-            shap = shap[idx]
-            
-            dx9 = shap[2]
-            dx8 = shap[3]
-            dx7 = shap[4]
-            dx6 = shap[5]
-            dx5 = shap[6]
-            dx4 = shap[7]
-            dx3 = shap[8]
-            dx2 = shap[9]
-            dx1 = shap[10]
-            
-            x9 = shap[0]
-            x8 = x9 + dx9
-            x7 = x8 + dx8
-            x6 = x7 + dx7
-            x5 = x6 + dx6
-            x4 = x5 + dx5
-            x3 = x4 + dx4
-            x2 = x3 + dx3
-            x1 = x2 + dx2
-            
-            c9 = (shap[2] < 0) * 'red' + (shap[2] >= 0) * 'blue'
-            c8 = (shap[3] < 0) * 'red' + (shap[3] >= 0) * 'blue'
-            c7 = (shap[4] < 0) * 'red' + (shap[4] >= 0) * 'blue'
-            c6 = (shap[5] < 0) * 'red' + (shap[5] >= 0) * 'blue'
-            c5 = (shap[6] < 0) * 'red' + (shap[6] >= 0) * 'blue'
-            c4 = (shap[7] < 0) * 'red' + (shap[7] >= 0) * 'blue'
-            c3 = (shap[8] < 0) * 'red' + (shap[8] >= 0) * 'blue'
-            c2 = (shap[9] < 0) * 'red' + (shap[9] >= 0) * 'blue'
-            c1 = (shap[10] < 0) * 'red' + (shap[10] >= 0) * 'blue'
-            
-            ax.arrow(x=x9, y=9, dx=dx9, dy=0, color=c9, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx9),
-                     length_includes_head=True)
-            ax.arrow(x=x8, y=8, dx=dx8, dy=0, color=c8, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx8),
-                     length_includes_head=True)
-            ax.arrow(x=x7, y=7, dx=dx7, dy=0, color=c7, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx7),
-                     length_includes_head=True)
-            ax.arrow(x=x6, y=6, dx=dx6, dy=0, color=c6, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx6),
-                     length_includes_head=True)
-            ax.arrow(x=x5, y=5, dx=dx5, dy=0, color=c5, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx5),
-                     length_includes_head=True)
-            ax.arrow(x=x4, y=4, dx=dx4, dy=0, color=c4, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx4),
-                     length_includes_head=True)
-            ax.arrow(x=x3, y=3, dx=dx3, dy=0, color=c3, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx3),
-                     length_includes_head=True)
-            ax.arrow(x=x2, y=2, dx=dx2, dy=0, color=c2, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx2),
-                     length_includes_head=True)
-            ax.arrow(x=x1, y=1, dx=dx1, dy=0, color=c1, width=1.0/3.0,
-                     head_width=1.0/3.0, head_length=0.15*np.abs(dx1),
-                     length_includes_head=True)
-            
-            ax.set_ylim([0.5, 9.5])
-            
-            plt.yticks([9,8,7,6,5,4,3,2,1], labels)
-            
-            sym_9 = (shap[2] < 0) * '-' + (shap[2] >= 0) * '+'
-            sym_8 = (shap[3] < 0) * '-' + (shap[3] >= 0) * '+'
-            sym_7 = (shap[4] < 0) * '-' + (shap[4] >= 0) * '+'
-            sym_6 = (shap[5] < 0) * '-' + (shap[5] >= 0) * '+'
-            sym_5 = (shap[6] < 0) * '-' + (shap[6] >= 0) * '+'
-            sym_4 = (shap[7] < 0) * '-' + (shap[7] >= 0) * '+'
-            sym_3 = (shap[8] < 0) * '-' + (shap[8] >= 0) * '+'
-            sym_2 = (shap[9] < 0) * '-' + (shap[9] >= 0) * '+'
-            sym_1 = (shap[10] < 0) * '-' + (shap[10] >= 0) * '+'
-            
-            ax.annotate(sym_9 + '{:.2f}'.format(round(np.abs(shap[2]), 4)),
-                        xy=(1.12, 9.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c9)
-            ax.annotate(sym_8 + '{:.2f}'.format(round(np.abs(shap[3]), 4)),
-                        xy=(1.12, 8.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c8)
-            ax.annotate(sym_7 + '{:.2f}'.format(round(np.abs(shap[4]), 4)),
-                        xy=(1.12, 7.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c7)
-            ax.annotate(sym_6 + '{:.2f}'.format(round(np.abs(shap[5]), 4)),
-                        xy=(1.12, 6.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c6)
-            ax.annotate(sym_5 + '{:.2f}'.format(round(np.abs(shap[6]), 4)),
-                        xy=(1.12, 5.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c5)
-            ax.annotate(sym_4 + '{:.2f}'.format(round(np.abs(shap[7]), 4)),
-                        xy=(1.12, 4.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c4)
-            ax.annotate(sym_3 + '{:.2f}'.format(round(np.abs(shap[8]), 4)),
-                        xy=(1.12, 3.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c3)
-            ax.annotate(sym_2 + '{:.2f}'.format(round(np.abs(shap[9]), 4)),
-                        xy=(1.12, 2.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c2)
-            ax.annotate(sym_1 + '{:.2f}'.format(round(np.abs(shap[10]), 4)),
-                        xy=(1.12, 1.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c1)
-            
-            c9 = (parm_diff[0] < 0) * 'red' + (parm_diff[0] >= 0) * 'blue'
-            c8 = (parm_diff[1] < 0) * 'red' + (parm_diff[1] >= 0) * 'blue'
-            c7 = (parm_diff[2] < 0) * 'red' + (parm_diff[2] >= 0) * 'blue'
-            c6 = (parm_diff[3] < 0) * 'red' + (parm_diff[3] >= 0) * 'blue'
-            c5 = (parm_diff[4] < 0) * 'red' + (parm_diff[4] >= 0) * 'blue'
-            c4 = (parm_diff[5] < 0) * 'red' + (parm_diff[5] >= 0) * 'blue'
-            c3 = (parm_diff[6] < 0) * 'red' + (parm_diff[6] >= 0) * 'blue'
-            c2 = (parm_diff[7] < 0) * 'red' + (parm_diff[7] >= 0) * 'blue'
-            c1 = (parm_diff[8] < 0) * 'red' + (parm_diff[8] >= 0) * 'blue'
-            
-            sym_9 = (parm_diff[0] < 0) * '-' + (parm_diff[0] >= 0) * '+'
-            sym_8 = (parm_diff[1] < 0) * '-' + (parm_diff[1] >= 0) * '+'
-            sym_7 = (parm_diff[2] < 0) * '-' + (parm_diff[2] >= 0) * '+'
-            sym_6 = (parm_diff[3] < 0) * '-' + (parm_diff[3] >= 0) * '+'
-            sym_5 = (parm_diff[4] < 0) * '-' + (parm_diff[4] >= 0) * '+'
-            sym_4 = (parm_diff[5] < 0) * '-' + (parm_diff[5] >= 0) * '+'
-            sym_3 = (parm_diff[6] < 0) * '-' + (parm_diff[6] >= 0) * '+'
-            sym_2 = (parm_diff[7] < 0) * '-' + (parm_diff[7] >= 0) * '+'
-            sym_1 = (parm_diff[8] < 0) * '-' + (parm_diff[8] >= 0) * '+'
-            
-            ax.annotate(sym_9 + '{:.2f}'.format(round(np.abs(parm_diff[0]), 4)),
-                        xy=(-0.12, 9.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c9)
-            ax.annotate(sym_8 + '{:.2f}'.format(round(np.abs(parm_diff[1]), 4)),
-                        xy=(-0.12, 8.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c8)
-            ax.annotate(sym_7 + '{:.2f}'.format(round(np.abs(parm_diff[2]), 4)),
-                        xy=(-0.12, 7.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c7)
-            ax.annotate(sym_6 + '{:.2f}'.format(round(np.abs(parm_diff[3]), 4)),
-                        xy=(-0.12, 6.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c6)
-            ax.annotate(sym_5 + '{:.2f}'.format(round(np.abs(parm_diff[4]), 4)),
-                        xy=(-0.12, 5.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c5)
-            ax.annotate(sym_4 + '{:.2f}'.format(round(np.abs(parm_diff[5]), 4)),
-                        xy=(-0.12, 4.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c4)
-            ax.annotate(sym_3 + '{:.2f}'.format(round(np.abs(parm_diff[6]), 4)),
-                        xy=(-0.12, 3.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c3)
-            ax.annotate(sym_2 + '{:.2f}'.format(round(np.abs(parm_diff[7]), 4)),
-                        xy=(-0.12, 2.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c2)
-            ax.annotate(sym_1 + '{:.2f}'.format(round(np.abs(parm_diff[8]), 4)),
-                        xy=(-0.12, 1.00), xycoords=('axes fraction', 'data'),
-                        ha='center', va='center', color=c1)
-            
-            ax.set_xlabel(r'$E_{ad}^{O, top}$ (eV)')
-            ax.spines[['left', 'right', 'top']].set_visible(False)
-            
-            ax.tick_params('y', length=0, width=0, which='major')
-            
-            ax.plot([x9, x9],[11, 0.5],'--', color='gray', linewidth=1)
-            
-            ax.plot([x8, x8], [9 + 1.0 / 3.0, 8 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x7, x7], [8 + 1.0 / 3.0, 7 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x6, x6], [7 + 1.0 / 3.0, 6 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x5, x5], [6 + 1.0 / 3.0, 5 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x4, x4], [5 + 1.0 / 3.0, 4 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x3, x3], [4 + 1.0 / 3.0, 3 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x2, x2], [3 + 1.0 / 3.0, 2 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            ax.plot([x1, x1], [2 + 1.0 / 3.0, 1 - 1.0 / 3.0],'--', color='gray',
-                    linewidth=1)
-            
-            ax.plot([x1 + dx1, x1 + dx1],[11, 0.5],'--', color='orange',
-                    linewidth=1)
-            
-            ax.annotate(ref_name + '\n{:.2f}'.format(round(x9, 4)),
-                        xy=(x9, 1.15), xycoords=('data', 'axes fraction'),
-                        ha='center', va='center', color='gray')
-            ax.annotate(target_name + '\n{:.2f}'.format(round(x1 + dx1, 4)),
-                        xy=(x1 + dx1, 1.05), xycoords=('data', 'axes fraction'),
-                        ha='center', va='center', color='orange')
-            
-            ax.annotate('SHAP',
-                        xy=(1.12, 1.05), xycoords=('axes fraction', 'axes fraction'),
-                        ha='center', va='center', color='black')
-            
-            fig.tight_layout()
-            
-            if save_fig == 'png':
-                fig.savefig(plot_name + '.png', bbox_inches='tight', dpi=600)
-            elif save_fig == 'pdf':
-                fig.savefig(plot_name + '.pdf', bbox_inches='tight')
+        fig.set_size_inches(3.375 * 2.0, 3.375)
+        self._draw_shap_waterfall(ax,
+                                  labels=plot_data[0],
+                                  feature_values=plot_data[1],
+                                  parm_values=plot_data[2],
+                                  starts=plot_data[3],
+                                  y_positions=plot_data[4],
+                                  start_energy=plot_data[5],
+                                  final_energy=plot_data[6],
+                                  ref_name=ref_name,
+                                  target_name=target_name)
+        fig.tight_layout()
+
+        save_figure(fig, plot_name, save_fig)
+        return fig, ax
 
 class Regression:
     def __init__(self,
@@ -1076,8 +571,8 @@ class Regression:
         if name_images is None:
             name_images = np.arange(len(atom_fea))
         
-        dataset = [((torch.Tensor(atom_fea),
-                     torch.Tensor(nbr_fea),
+        dataset = [((torch.as_tensor(atom_fea, dtype=torch.float32),
+                     torch.as_tensor(nbr_fea, dtype=torch.float32),
                      torch.LongTensor(nbr_fea_idx)),
                     name_images,
                     site_inx)]
@@ -1136,84 +631,44 @@ class Regression:
         self.site_inx = site_inx
         self.vad2 = vad2
     
+    def _checkpoint_path(self):
+        """Return the pretrained checkpoint for the current adsorption model."""
+        adsorbate, spec = AdsorptionEnergy._spec_for(phys_model=self.phys_model)
+        return pretrained_path('adsorption_energy', adsorbate, 'atop', f'model_{self.model_inx}.pth.tar')
+
+    def _move_input_batch(self, batch_input):
+        """Move a collated adsorption graph batch to the active device."""
+        atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx, site_ids = batch_input
+        device = torch_device()
+        return (
+            atom_fea.to(device, non_blocking=True),
+            nbr_fea.to(device, non_blocking=True),
+            nbr_fea_idx.to(device, non_blocking=True),
+            [idx.to(device, non_blocking=True) for idx in crystal_atom_idx],
+            [idx.to(device, non_blocking=True) for idx in site_ids],
+        )
+
     def eval_model(self, **kwargs):
-        if self.phys_model == 'OH_atop':
-            if self.cuda:
-                best_checkpoint = torch.load('./data/pretrained/adsorption_energy/OH/atop/model_' + str(self.model_inx) + '.pth.tar')
-            else:
-                best_checkpoint = torch.load('./data/pretrained/adsorption_energy/OH/atop/model_' + str(self.model_inx) + '.pth.tar', map_location=torch.device('cpu'))
-            
-            self.model.load_state_dict(best_checkpoint['state_dict'])
-            
-            # switch to evaluate mode
-            self.model.eval()
-            
-            for i, (input, batch_cif_ids) in enumerate(self.data_loader):
-                with torch.no_grad():
-                    if self.cuda:
-                        input_var = (Variable(input[0].cuda(non_blocking=True)),
-                                     Variable(input[1].cuda(non_blocking=True)),
-                                     input[2].cuda(non_blocking=True),
-                                     [crys_idx.cuda(non_blocking=True)
-                                      for crys_idx in input[3]],
-                                     [site_inx.cuda(non_blocking=True)
-                                      for site_inx in input[4]])
-                    else:
-                        input_var = (Variable(input[0]),
-                                     Variable(input[1]),
-                                     input[2],
-                                     input[3],
-                                     input[4])
-                
-                # compute output
+        """Evaluate one pretrained adsorption-energy ensemble member."""
+        load_checkpoint_state(self.model, self._checkpoint_path(), torch_device())
+        self.model.eval()
+
+        output = parm = None
+        with torch.no_grad():
+            for batch_input, batch_cif_ids in self.data_loader:
+                input_var = self._move_input_batch(batch_input)
                 cnn_output = self.model(*input_var)
-                
                 output, parm = Chemisorption.newns_anderson_semi(
                     self,
                     cnn_output,
                     phys_model=self.phys_model,
-                    **dict(**kwargs, batch_cif_ids=batch_cif_ids))
-            
-            return output, parm
-        if self.phys_model == 'O_atop':
-            if self.cuda:
-                best_checkpoint = torch.load('./data/pretrained/adsorption_energy/O/atop/model_' + str(self.model_inx) + '.pth.tar')
-            else:
-                best_checkpoint = torch.load('./data/pretrained/adsorption_energy/O/atop/model_' + str(self.model_inx) + '.pth.tar', map_location=torch.device('cpu'))
-            
-            self.model.load_state_dict(best_checkpoint['state_dict'])
-            
-            # switch to evaluate mode
-            self.model.eval()
-            
-            for i, (input, batch_cif_ids) in enumerate(self.data_loader):
-                with torch.no_grad():
-                    if self.cuda:
-                        input_var = (Variable(input[0].cuda(non_blocking=True)),
-                                     Variable(input[1].cuda(non_blocking=True)),
-                                     input[2].cuda(non_blocking=True),
-                                     [crys_idx.cuda(non_blocking=True)
-                                      for crys_idx in input[3]],
-                                     [site_inx.cuda(non_blocking=True)
-                                      for site_inx in input[4]])
-                    else:
-                        input_var = (Variable(input[0]),
-                                     Variable(input[1]),
-                                     input[2],
-                                     input[3],
-                                     input[4])
-                
-                # compute output
-                cnn_output = self.model(*input_var)
-                
-                output, parm = Chemisorption.newns_anderson_semi(
-                    self,
-                    cnn_output,
-                    phys_model=self.phys_model,
-                    **dict(**kwargs, batch_cif_ids=batch_cif_ids))
-            
-            return output, parm
-    
+                    **dict(**kwargs, batch_cif_ids=batch_cif_ids),
+                )
+
+        if output is None or parm is None:
+            raise RuntimeError("No adsorption prediction was produced; check the data loader.")
+        return output, parm
+
     def get_data_loader(self,
                         dataset,
                         collate_fn=default_collate,
@@ -1221,16 +676,14 @@ class Regression:
                         num_workers=0,
                         pin_memory=False,
                         random_seed=None):
-        
-        data_sampler = SubsetRandomSampler(np.arange(len(dataset)))
-        
-        data_loader = DataLoader(dataset, batch_size=batch_size,
-                                 sampler=data_sampler,
-                                 num_workers=num_workers,
-                                 collate_fn=collate_fn,
-                                 pin_memory=pin_memory)
-        
-        return data_loader
+        """Return a one-pass inference loader for one adsorption structure."""
+        return make_data_loader(
+            dataset,
+            collate_fn=collate_fn,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
 
     def collate_pool(self, dataset_list):
         '''
@@ -1325,9 +778,9 @@ class ConvLayer(nn.Module):
         Parameters
         ----------
 
-        atom_in_fea: Variable(torch.Tensor) shape (N, atom_fea_len)
+        atom_in_fea: (torch.Tensor) shape (N, atom_fea_len)
           Atom hidden features before convolution
-        nbr_fea: Variable(torch.Tensor) shape (N, M, nbr_fea_len)
+        nbr_fea: (torch.Tensor) shape (N, M, nbr_fea_len)
           Bond features of each atom's M neighbors
         nbr_fea_idx: torch.LongTensor shape (N, M)
           Indices of M neighbors of each atom
@@ -1335,7 +788,7 @@ class ConvLayer(nn.Module):
         Returns
         -------
 
-        atom_out_fea: nn.Variable shape (N, atom_fea_len)
+        atom_out_fea: torch.Tensor shape (N, atom_fea_len)
           Atom hidden features after convolution
 
         '''
@@ -1411,9 +864,9 @@ class CrystalGraphConvNet(nn.Module):
         Parameters
         ----------
 
-        atom_fea: Variable(torch.Tensor) shape (N, orig_atom_fea_len)
+        atom_fea: (torch.Tensor) shape (N, orig_atom_fea_len)
           Atom features from atom type
-        nbr_fea: Variable(torch.Tensor) shape (N, M, nbr_fea_len)
+        nbr_fea: (torch.Tensor) shape (N, M, nbr_fea_len)
           Bond features of each atom's M neighbors
         nbr_fea_idx: torch.LongTensor shape (N, M)
           Indices of M neighbors of each atom
@@ -1423,7 +876,7 @@ class CrystalGraphConvNet(nn.Module):
         Returns
         -------
 
-        prediction: nn.Variable shape (N, )
+        prediction: torch.Tensor shape (N, )
           Atom hidden features after convolution
 
         '''
@@ -1451,7 +904,7 @@ class CrystalGraphConvNet(nn.Module):
         Parameters
         ----------
 
-        atom_fea: Variable(torch.Tensor) shape (N, atom_fea_len)
+        atom_fea: (torch.Tensor) shape (N, atom_fea_len)
           Atom feature vectors of the batch
         crystal_atom_idx: list of torch.LongTensor of length N0
           Mapping from the crystal idx to atom idx
@@ -1463,7 +916,70 @@ class CrystalGraphConvNet(nn.Module):
         return torch.cat(summed_fea, dim=0)
 
 
+
+
+def _safe_newns_denominator(denominator: torch.Tensor, eps: float) -> torch.Tensor:
+    """Avoid singular denominators while preserving the original sign convention."""
+    abs_denom = torch.abs(denominator)
+    return (denominator * (abs_denom > eps)
+            + eps * (abs_denom <= eps) * (denominator >= 0)
+            - eps * (abs_denom <= eps) * (denominator < 0))
+
+
+def _semi_ellipse_dos(ergy: torch.Tensor, d_cen: torch.Tensor, width: torch.Tensor) -> torch.Tensor:
+    """Build the normalized semi-elliptical d-band DOS used by the TinNet theory module."""
+    dos_d = (torch.abs(1 - ((ergy - d_cen) / width) ** 2)) ** 0.5
+    dos_d = dos_d * (torch.abs(ergy - d_cen) < width)
+    dos_d = dos_d + (torch.trapz(dos_d, ergy) <= 1e-10) / len(ergy)
+    return dos_d / torch.trapz(dos_d, ergy)
+
+
+def _newns_orbital_terms(
+    *,
+    ergy: torch.Tensor,
+    h: torch.Tensor,
+    fermi: int,
+    vad2: torch.Tensor,
+    dos_d: torch.Tensor,
+    adse: torch.Tensor,
+    beta: torch.Tensor,
+    delta: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the Newns-Anderson hybridization term and free adsorbate occupancy.
+
+    This routine is shared by all adsorbate frontier orbitals. It replaces the
+    repeated orbital-specific blocks in the original implementation without
+    changing the mathematical operations.
+    """
+    wdos = np.pi * (beta * vad2 * dos_d) + delta
+    wdos_reference = np.pi * (0 * vad2 * dos_d) + delta
+
+    htwdos = torch.imag(torch.fft.ifft(torch.fft.fft(wdos) * h))
+    denominator = _safe_newns_denominator(ergy - adse - htwdos, eps)
+    arctan = torch.atan(wdos / denominator)
+    arctan = (arctan - np.pi) * (arctan > 0) + arctan * (arctan <= 0)
+    d_hyb = 2 / np.pi * torch.trapz(arctan[:fermi], ergy[:fermi])
+
+    lorentzian = (1 / np.pi) * delta / ((ergy - adse) ** 2 + delta ** 2)
+    na = torch.trapz(lorentzian[:fermi], ergy[:fermi])
+
+    denominator_reference = _safe_newns_denominator(ergy - adse, eps)
+    arctan_reference = torch.atan(wdos_reference / denominator_reference)
+    arctan_reference = ((arctan_reference - np.pi) * (arctan_reference > 0)
+                        + arctan_reference * (arctan_reference <= 0))
+    d_hyb_reference = 2 / np.pi * torch.trapz(arctan_reference[:fermi], ergy[:fermi])
+
+    return d_hyb - d_hyb_reference, na
+
+
 class Chemisorption:
+    """Theory module used during checkpoint inference.
+
+    This class uses the same orbital-loop implementation pattern as
+    AdsorptionEnergy.tinnet_ead, but keeps scalar tensor operations because
+    the pretrained Regression model evaluates one structure at a time.
+    """
     def __init__(self, phys_model, **kwargs):
         # Initialize the class
         if phys_model == 'OH_atop':
@@ -1475,223 +991,66 @@ class Chemisorption:
             self.model_num_input = 6
     
     def newns_anderson_semi(self, namodel_in, phys_model, **kwargs):
+        """Evaluate the semi-elliptical Newns-Anderson theory module.
+
+        The original implementation repeated the same Hilbert-transform and
+        hybridization-energy calculation for each adsorbate frontier orbital.  This
+        version expresses each orbital as a compact specification while preserving
+        the exact ordering of returned parameters used by SHAP and the notebook.
+        """
         namodel_in = torch.flatten(namodel_in)
         vad2 = self.vad2
         h = self.h
         ergy = self.ergy
-        fermi = np.argsort(abs(ergy.detach().cpu().numpy()))[0] + 1
+        fermi = np.argsort(torch.abs(ergy).detach().cpu().numpy())[0] + 1
         eps = np.finfo(float).eps
-        
+
         if phys_model == 'OH_atop':
-            adse_1 = namodel_in[0]
-            beta_1 = torch.nn.functional.softplus(namodel_in[1])
-            delta_1 = torch.nn.functional.softplus(namodel_in[2])
-            adse_2 = namodel_in[3]
-            beta_2 = torch.nn.functional.softplus(namodel_in[4])
-            delta_2 = torch.nn.functional.softplus(namodel_in[5])
-            adse_3 = namodel_in[6]
-            beta_3 = torch.nn.functional.softplus(namodel_in[7])
-            delta_3 = torch.nn.functional.softplus(namodel_in[8])
             d_cen = namodel_in[9]
             width = torch.nn.functional.softplus(namodel_in[10])
-            
-            # Semi-ellipse
-            dos_d = (abs(1-((ergy-d_cen)/width)**2))**0.5
-            dos_d = dos_d * (abs(ergy-d_cen) < width)
-            dos_d = dos_d + (torch.trapz(dos_d,ergy) <= 1e-10) / len(ergy)
-            dos_d = dos_d / torch.trapz(dos_d,ergy)
-            
-            f = torch.trapz(dos_d[0:fermi],ergy[0:fermi])
-            
-            wdos_1 = np.pi * (beta_1*vad2*dos_d) + delta_1
-            wdos_1_ = np.pi * (0*vad2*dos_d) + delta_1
-            wdos_2 = np.pi * (beta_2*vad2*dos_d) + delta_2
-            wdos_2_ = np.pi * (0*vad2*dos_d) + delta_2
-            wdos_3 = np.pi * (beta_3*vad2*dos_d) + delta_3
-            wdos_3_ = np.pi * (0*vad2*dos_d) + delta_3
-            
-            # Hilbert transform
-            af_1 = torch.fft.fft(wdos_1)
-            htwdos_1 = torch.imag(torch.fft.ifft(af_1*h))
-            deno_1 = (ergy - adse_1 - htwdos_1)
-            deno_1 = deno_1 * (torch.abs(deno_1) > eps) + eps * (torch.abs(deno_1) <= eps) * (deno_1 >= 0) - eps * (torch.abs(deno_1) <= eps) * (deno_1 < 0)
-            integrand_1 = wdos_1 / deno_1
-            arctan_1 = torch.atan(integrand_1)
-            arctan_1 = (arctan_1-np.pi)*(arctan_1 > 0) + (arctan_1)*(arctan_1 <= 0)
-            d_hyb_1 = 2 / np.pi * torch.trapz(arctan_1[0:fermi],ergy[0:fermi])
-            
-            lorentzian_1 = (1/np.pi) * (delta_1)/((ergy - adse_1)**2 + delta_1**2)
-            na_1 = torch.trapz(lorentzian_1[0:fermi], ergy[0:fermi])
-            
-            deno_1_ = (ergy - adse_1)
-            deno_1_ = deno_1_ * (torch.abs(deno_1_) > eps) + eps * (torch.abs(deno_1_) <= eps) * (deno_1_ >= 0) - eps * (torch.abs(deno_1_) <= eps) * (deno_1_ < 0)
-            integrand_1_ = wdos_1_ / deno_1_
-            arctan_1_ = torch.atan(integrand_1_)
-            arctan_1_ = (arctan_1_-np.pi)*(arctan_1_ > 0) + (arctan_1_)*(arctan_1_ <= 0)
-            d_hyb_1_ = 2 / np.pi * torch.trapz(arctan_1_[0:fermi],ergy[0:fermi])
-            
-            energy_NA_1 = d_hyb_1 - d_hyb_1_
-            
-            dos_ads_1 = wdos_1/(deno_1**2+wdos_1**2)/np.pi
-            dos_ads_1 = dos_ads_1/torch.trapz(dos_ads_1, ergy)
-            
-            af_2 = torch.fft.fft(wdos_2)
-            htwdos_2 = torch.imag(torch.fft.ifft(af_2*h))
-            deno_2 = (ergy - adse_2 - htwdos_2)
-            deno_2 = deno_2 * (torch.abs(deno_2) > eps) + eps * (torch.abs(deno_2) <= eps) * (deno_2 >= 0) - eps * (torch.abs(deno_2) <= eps) * (deno_2 < 0)
-            integrand_2 = wdos_2 / deno_2
-            arctan_2 = torch.atan(integrand_2)
-            arctan_2 = (arctan_2-np.pi)*(arctan_2 > 0) + (arctan_2)*(arctan_2 <= 0)
-            d_hyb_2 = 2 / np.pi * torch.trapz(arctan_2[0:fermi],ergy[0:fermi])
-            
-            lorentzian_2 = (1/np.pi) * (delta_2)/((ergy - adse_2)**2 + delta_2**2)
-            na_2 = torch.trapz(lorentzian_2[0:fermi], ergy[0:fermi])
-            
-            deno_2_ = (ergy - adse_2)
-            deno_2_ = deno_2_ * (torch.abs(deno_2_) > eps) + eps * (torch.abs(deno_2_) <= eps) * (deno_2_ >= 0) - eps * (torch.abs(deno_2_) <= eps) * (deno_2_ < 0)
-            integrand_2_ = wdos_2_ / deno_2_
-            arctan_2_ = torch.atan(integrand_2_)
-            arctan_2_ = (arctan_2_-np.pi)*(arctan_2_ > 0) + (arctan_2_)*(arctan_2_ <= 0)
-            d_hyb_2_ = 2 / np.pi * torch.trapz(arctan_2_[0:fermi],ergy[0:fermi])
-            
-            energy_NA_2 = d_hyb_2 - d_hyb_2_
-            
-            dos_ads_2 = wdos_2/(deno_2**2+wdos_2**2)/np.pi
-            dos_ads_2 = dos_ads_2/torch.trapz(dos_ads_2, ergy)
-            
-            af_3 = torch.fft.fft(wdos_3)
-            htwdos_3 = torch.imag(torch.fft.ifft(af_3*h))
-            deno_3 = (ergy - adse_3 - htwdos_3)
-            deno_3 = deno_3 * (torch.abs(deno_3) > eps) + eps * (torch.abs(deno_3) <= eps) * (deno_3 >= 0) - eps * (torch.abs(deno_3) <= eps) * (deno_3 < 0)
-            integrand_3 = wdos_3 / deno_3
-            arctan_3 = torch.atan(integrand_3)
-            arctan_3 = (arctan_3-np.pi)*(arctan_3 > 0) + (arctan_3)*(arctan_3 <= 0)
-            d_hyb_3 = 2 / np.pi * torch.trapz(arctan_3[0:fermi],ergy[0:fermi])
-            
-            lorentzian_3 = (1/np.pi) * (delta_3)/((ergy - adse_3)**2 + delta_3**2)
-            na_3 = torch.trapz(lorentzian_3[0:fermi], ergy[0:fermi])
-            
-            deno_3_ = (ergy - adse_3)
-            deno_3_ = deno_3_ * (torch.abs(deno_3_) > eps) + eps * (torch.abs(deno_3_) <= eps) * (deno_3_ >= 0) - eps * (torch.abs(deno_3_) <= eps) * (deno_3_ < 0)
-            integrand_3_ = wdos_3_ / deno_3_
-            arctan_3_ = torch.atan(integrand_3_)
-            arctan_3_ = (arctan_3_-np.pi)*(arctan_3_ > 0) + (arctan_3_)*(arctan_3_ <= 0)
-            d_hyb_3_ = 2 / np.pi * torch.trapz(arctan_3_[0:fermi],ergy[0:fermi])
-            
-            energy_NA_3 = d_hyb_3 - d_hyb_3_
-            
-            dos_ads_3 = wdos_3/(deno_3**2+wdos_3**2)/np.pi
-            dos_ads_3 = dos_ads_3/torch.trapz(dos_ads_3, ergy)
-            
-            energy = (self.esp
-                      + (energy_NA_1 + 2*(na_1+f)*self.alpha*beta_1*vad2)
-                      + (energy_NA_2 + 2*(na_2+f)*self.alpha*beta_2*vad2) * 2
-                      + (energy_NA_3 + 2*(na_3+f)*self.alpha*beta_3*vad2))
-            
-            parm = torch.Tensor((energy[0],
-                                 vad2[0],
-                                 d_cen,
-                                 width,
-                                 adse_1,
-                                 beta_1,
-                                 delta_1,
-                                 adse_2,
-                                 beta_2,
-                                 delta_2,
-                                 adse_3,
-                                 beta_3,
-                                 delta_3))
-            
-            return energy.detach().cpu().numpy(), parm
-        if phys_model == 'O_atop':
-            adse_2 = namodel_in[0]
-            beta_2 = torch.nn.functional.softplus(namodel_in[1])
-            delta_2 = torch.nn.functional.softplus(namodel_in[2])
-            adse_3 = namodel_in[3]
-            beta_3 = torch.nn.functional.softplus(namodel_in[4])
-            delta_3 = torch.nn.functional.softplus(namodel_in[5])
-            
+            orbital_specs = [
+                # (adsorbate resonance, coupling coefficient, broadening, degeneracy, orthogonalization coefficient)
+                (namodel_in[0], torch.nn.functional.softplus(namodel_in[1]), namodel_in[2], 1, self.alpha),
+                (namodel_in[3], torch.nn.functional.softplus(namodel_in[4]), namodel_in[5], 2, self.alpha),
+                (namodel_in[6], torch.nn.functional.softplus(namodel_in[7]), namodel_in[8], 1, self.alpha),
+            ]
+        elif phys_model == 'O_atop':
             d_cen = self.d_cen
             width = self.half_width
-            
-            # Semi-ellipse
-            dos_d = (abs(1-((ergy-d_cen)/width)**2))**0.5
-            dos_d = dos_d * (abs(ergy-d_cen) < width)
-            dos_d = dos_d + (torch.trapz(dos_d,ergy) <= 1e-10) / len(ergy)
-            dos_d = dos_d / torch.trapz(dos_d,ergy)
-            
-            f = torch.trapz(dos_d[0:fermi],ergy[0:fermi])
-            
-            wdos_2 = np.pi * (beta_2*vad2*dos_d) + delta_2
-            wdos_2_ = np.pi * (0*vad2*dos_d) + delta_2
-            wdos_3 = np.pi * (beta_3*vad2*dos_d) + delta_3
-            wdos_3_ = np.pi * (0*vad2*dos_d) + delta_3
-            
-            # Hilbert transform
-            af_2 = torch.fft.fft(wdos_2)
-            htwdos_2 = torch.imag(torch.fft.ifft(af_2*h))
-            deno_2 = (ergy - adse_2 - htwdos_2)
-            deno_2 = deno_2 * (torch.abs(deno_2) > eps) + eps * (torch.abs(deno_2) <= eps) * (deno_2 >= 0) - eps * (torch.abs(deno_2) <= eps) * (deno_2 < 0)
-            integrand_2 = wdos_2 / deno_2
-            arctan_2 = torch.atan(integrand_2)
-            arctan_2 = (arctan_2-np.pi)*(arctan_2 > 0) + (arctan_2)*(arctan_2 <= 0)
-            d_hyb_2 = 2 / np.pi * torch.trapz(arctan_2[0:fermi],ergy[0:fermi])
-            
-            lorentzian_2 = (1/np.pi) * (delta_2)/((ergy - adse_2)**2 + delta_2**2)
-            na_2 = torch.trapz(lorentzian_2[0:fermi], ergy[0:fermi])
-            
-            deno_2_ = (ergy - adse_2)
-            deno_2_ = deno_2_ * (torch.abs(deno_2_) > eps) + eps * (torch.abs(deno_2_) <= eps) * (deno_2_ >= 0) - eps * (torch.abs(deno_2_) <= eps) * (deno_2_ < 0)
-            integrand_2_ = wdos_2_ / deno_2_
-            arctan_2_ = torch.atan(integrand_2_)
-            arctan_2_ = (arctan_2_-np.pi)*(arctan_2_ > 0) + (arctan_2_)*(arctan_2_ <= 0)
-            d_hyb_2_ = 2 / np.pi * torch.trapz(arctan_2_[0:fermi],ergy[0:fermi])
-            
-            energy_NA_2 = d_hyb_2 - d_hyb_2_
-            
-            dos_ads_2 = wdos_2/(deno_2**2+wdos_2**2)/np.pi
-            dos_ads_2 = dos_ads_2/torch.trapz(dos_ads_2, ergy)
-            
-            af_3 = torch.fft.fft(wdos_3)
-            htwdos_3 = torch.imag(torch.fft.ifft(af_3*h))
-            deno_3 = (ergy - adse_3 - htwdos_3)
-            deno_3 = deno_3 * (torch.abs(deno_3) > eps) + eps * (torch.abs(deno_3) <= eps) * (deno_3 >= 0) - eps * (torch.abs(deno_3) <= eps) * (deno_3 < 0)
-            integrand_3 = wdos_3 / deno_3
-            arctan_3 = torch.atan(integrand_3)
-            arctan_3 = (arctan_3-np.pi)*(arctan_3 > 0) + (arctan_3)*(arctan_3 <= 0)
-            d_hyb_3 = 2 / np.pi * torch.trapz(arctan_3[0:fermi],ergy[0:fermi])
-            
-            lorentzian_3 = (1/np.pi) * (delta_3)/((ergy - adse_3)**2 + delta_3**2)
-            na_3 = torch.trapz(lorentzian_3[0:fermi], ergy[0:fermi])
-            
-            deno_3_ = (ergy - adse_3)
-            deno_3_ = deno_3_ * (torch.abs(deno_3_) > eps) + eps * (torch.abs(deno_3_) <= eps) * (deno_3_ >= 0) - eps * (torch.abs(deno_3_) <= eps) * (deno_3_ < 0)
-            integrand_3_ = wdos_3_ / deno_3_
-            arctan_3_ = torch.atan(integrand_3_)
-            arctan_3_ = (arctan_3_-np.pi)*(arctan_3_ > 0) + (arctan_3_)*(arctan_3_ <= 0)
-            d_hyb_3_ = 2 / np.pi * torch.trapz(arctan_3_[0:fermi],ergy[0:fermi])
-            
-            energy_NA_3 = d_hyb_3 - d_hyb_3_
-            
-            dos_ads_3 = wdos_3/(deno_3**2+wdos_3**2)/np.pi
-            dos_ads_3 = dos_ads_3/torch.trapz(dos_ads_3, ergy)
-            
-            energy = (self.esp
-                      + (energy_NA_2 + 2*(na_2+f)*self.alpha_2*beta_2*vad2)
-                      + (energy_NA_3 + 2*(na_3+f)*self.alpha_3*beta_3*vad2) * 2)
-            
-            parm = torch.Tensor((energy[0],
-                                 vad2[0],
-                                 d_cen,
-                                 width,
-                                 adse_2,
-                                 beta_2,
-                                 delta_2,
-                                 adse_3,
-                                 beta_3,
-                                 delta_3))
-            
-            return energy.detach().cpu().numpy(), parm
+            orbital_specs = [
+                (namodel_in[0], torch.nn.functional.softplus(namodel_in[1]), namodel_in[2], 1, self.alpha_2),
+                (namodel_in[3], torch.nn.functional.softplus(namodel_in[4]), namodel_in[5], 2, self.alpha_3),
+            ]
+        else:
+            raise ValueError(f"Unsupported chemisorption model: {phys_model}")
+
+        dos_d = _semi_ellipse_dos(ergy, d_cen, width)
+        filling = torch.trapz(dos_d[:fermi], ergy[:fermi])
+
+        energy = self.esp
+        returned_parameters = [energy.new_tensor(0.0) if torch.is_tensor(energy) else torch.as_tensor(0.0, dtype=ergy.dtype, device=ergy.device),
+                               vad2[0], d_cen, width]
+
+        orbital_parameters = []
+        for adse, beta, delta_raw, degeneracy, alpha in orbital_specs:
+            delta = torch.nn.functional.softplus(delta_raw)
+            energy_na, adsorbate_occupancy = _newns_orbital_terms(
+                ergy=ergy,
+                h=h,
+                fermi=fermi,
+                vad2=vad2,
+                dos_d=dos_d,
+                adse=adse,
+                beta=beta,
+                delta=delta,
+                eps=eps,
+            )
+            energy = energy + degeneracy * (energy_na + 2 * (adsorbate_occupancy + filling) * alpha * beta * vad2)
+            orbital_parameters.extend((adse, beta, delta))
+
+        returned_parameters[0] = energy[0]
+        parm = stack_scalar_parameters(tuple(returned_parameters + orbital_parameters), like=energy)
+        return energy.detach().cpu().numpy(), parm
 
 class Features:
     '''
@@ -1728,7 +1087,7 @@ class Features:
         
         # Load superstructure of atom features
         if dict_atom_fea is None:
-            self.dict_atom_fea = self.dict_atom_fea_default()
+            self.dict_atom_fea = atom_features()
         else:
             self.dict_atom_fea = dict_atom_fea
         
@@ -1784,544 +1143,4 @@ class Features:
                          / self.step**2)
         
         return atom_fea, nbr_fea, nbr_fea_idx
-    
-    def dict_atom_prop_default(self):
-        atom_prop_dict = {'Ca': {'f': 0.1, 'vad2': 20.8 , 'eps_d':  None},
-                          'Sc': {'f': 0.2, 'vad2':  7.90, 'eps_d':  None},
-                          'Ti': {'f': 0.3, 'vad2':  4.65, 'eps_d':  1.50},
-                          'V' : {'f': 0.4, 'vad2':  3.15, 'eps_d':  1.06},
-                          'Cr': {'f': 0.5, 'vad2':  2.35, 'eps_d':  0.16},
-                          'Mn': {'f': 0.6, 'vad2':  1.94, 'eps_d':  0.07},
-                          'Fe': {'f': 0.7, 'vad2':  1.59, 'eps_d': -0.92},
-                          'Co': {'f': 0.8, 'vad2':  1.34, 'eps_d': -1.17},
-                          'Ni': {'f': 0.9, 'vad2':  1.16, 'eps_d': -1.29},
-                          'Cu': {'f': 1.0, 'vad2':  1.00, 'eps_d': -2.67},
-                          'Zn': {'f': 1.0, 'vad2':  0.46, 'eps_d':  None},
-                          'Sr': {'f': 0.1, 'vad2': 36.5 , 'eps_d':  None},
-                          'Y' : {'f': 0.2, 'vad2': 17.3 , 'eps_d':  None},
-                          'Zr': {'f': 0.3, 'vad2': 10.90, 'eps_d':  1.95},
-                          'Nb': {'f': 0.4, 'vad2':  7.73, 'eps_d':  1.41},
-                          'Mo': {'f': 0.5, 'vad2':  6.62, 'eps_d':  0.35},
-                          'Tc': {'f': 0.6, 'vad2':  4.71, 'eps_d': -0.60},
-                          'Ru': {'f': 0.7, 'vad2':  3.87, 'eps_d': -1.41},
-                          'Rh': {'f': 0.8, 'vad2':  3.32, 'eps_d': -1.73},
-                          'Pd': {'f': 0.9, 'vad2':  2.78, 'eps_d': -1.83},
-                          'Ag': {'f': 1.0, 'vad2':  2.26, 'eps_d': -4.30},
-                          'Cd': {'f': 1.0, 'vad2':  1.58, 'eps_d':  None},
-                          'Ba': {'f': 0.1, 'vad2': 41.5 , 'eps_d':  None},
-                          'Lu': {'f': 0.2, 'vad2': 17.1 , 'eps_d':  None},
-                          'Hf': {'f': 0.3, 'vad2': 11.90, 'eps_d':  2.47},
-                          'Ta': {'f': 0.4, 'vad2':  9.05, 'eps_d':  2.00},
-                          'W' : {'f': 0.5, 'vad2':  7.27, 'eps_d':  0.77},
-                          'Re': {'f': 0.6, 'vad2':  6.04, 'eps_d': -0.51},
-                          'Os': {'f': 0.7, 'vad2':  5.13, 'eps_d':  None},
-                          'Ir': {'f': 0.8, 'vad2':  4.45, 'eps_d': -2.11},
-                          'Pt': {'f': 0.9, 'vad2':  3.90, 'eps_d': -2.25},
-                          'Au': {'f': 1.0, 'vad2':  3.35, 'eps_d': -3.56},
-                          'Hg': {'f': 1.0, 'vad2':  2.64, 'eps_d':  None}}
-        return atom_prop_dict
-    
-    def dict_atom_fea_default(self):
-        # Default superstructure of atom features
-        atom_fea_dict = {
-            1: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            2: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0],
-            3: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0],
-            4: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            5: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            7: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            8: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            9: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            10: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            11: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            12: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            13: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            14: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            15: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            16: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            17: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            18: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            19: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            20: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            21: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            22: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            23: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            24: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            25: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            26: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            27: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            28: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            29: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            30: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            31: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            32: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            33: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            34: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            35: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            36: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            37: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            38: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            39: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            40: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            41: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            42: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            43: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            44: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            45: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            46: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            47: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            48: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            49: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            50: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            51: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            52: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            53: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            54: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            55: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            56: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            57: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            58: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            59: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            60: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            61: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            62: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            63: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            64: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            65: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            66: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            67: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            68: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            69: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            70: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            71: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            72: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            73: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            74: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            75: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            76: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            77: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            78: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            79: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            80: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            81: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            82: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            83: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            84: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            85: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            86: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            87: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            88: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            89: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            90: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            91: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            92: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            93: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            94: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            95: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            96: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            97: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            98: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            99: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            100: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}
-        return atom_fea_dict
+

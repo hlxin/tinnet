@@ -1,53 +1,78 @@
 #!/usr/bin/env python
+"""TinNet cohesive-energy prediction for transition-metal alloys.
+
+The model embeds a renormalized-atom cohesion theory module in a graph neural
+network while preserving the original notebook-facing API.
+"""
 # This script is adapted from scripts of Jeffrey C. Grossman 
 # and Zachary W. Ulissi.
 
 import numpy as np
-import os
-import time
-import random
-import shutil
-import pickle
-import csv
 import multiprocessing
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import matplotlib.pyplot as plt
 import shap
 
-from ase import io
-from ase.db import connect
-from pylab import *
 from copy import deepcopy
-from torch.autograd import Variable
-from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler
+
+try:
+    from .tinnet_utils import (
+        atom_features,
+        as_float_tensor,
+        as_long_tensor,
+        copy_without_adsorbates,
+        cohesive_constant_for_symbols,
+        flatten_nested,
+        data_path,
+        load_checkpoint_state,
+        normalize_atom_index,
+        normalize_site_indices,
+        pretrained_path,
+        set_publication_style,
+        save_figure,
+        signed_color,
+        signed_label,
+        stack_scalar_parameters,
+        torch_device,
+        validate_atom_index,
+        values_for_symbols,
+    )
+except ImportError:  # Allows running this file directly during debugging.
+    from tinnet_utils import (
+        atom_features,
+        as_float_tensor,
+        as_long_tensor,
+        copy_without_adsorbates,
+        cohesive_constant_for_symbols,
+        flatten_nested,
+        data_path,
+        load_checkpoint_state,
+        normalize_atom_index,
+        normalize_site_indices,
+        pretrained_path,
+        set_publication_style,
+        save_figure,
+        signed_color,
+        signed_label,
+        stack_scalar_parameters,
+        torch_device,
+        validate_atom_index,
+        values_for_symbols,
+    )
 from pymatgen.analysis.structure_analyzer import VoronoiConnectivity
 from pymatgen.io.ase import AseAtomsAdaptor
 
 
-def _copy_without_adsorbates(image):
-    """Return a copy of an ASE Atoms object with O/H adsorbates removed."""
-    clean_image = image.copy()
-    adsorbate_indices = [
-        i for i, atom in enumerate(clean_image) if atom.symbol in {"O", "H"}
-    ]
-    for i in sorted(adsorbate_indices, reverse=True):
-        del clean_image[i]
-    return clean_image
-
-def _values_for_symbols(symbols, values, name):
-    """Resolve per-element constants and fail with a clear message if unsupported."""
-    missing = sorted({symbol for symbol in symbols if symbol not in values})
-    if missing:
-        raise KeyError(f"Missing {name} constants for element(s): {', '.join(missing)}")
-    return [values[symbol] for symbol in symbols]
-
-
 class CohesiveEnergy:
+    """Predict cohesive energy with the TinNet cohesion-theory module.
+
+    The model returns ensemble predictions and, optionally, interpretable
+    contribution terms used by the SHAP explanation routine.
+    """
     def __init__(self,
                  image=None,
                  name='Name'):
@@ -56,97 +81,112 @@ class CohesiveEnergy:
     
     def predict(self,
                 image=None,
-                return_all_parm=False):
-        
+                return_all_parm=False,
+                atom_fea_len=150,
+                n_conv=5,
+                h_fea_len=128,
+                n_h=2,
+                batch_size=1024,
+                n_ensemble_models=10):
+        """Run the cohesive-energy ensemble prediction.
+
+        The architecture hyperparameters are exposed as keyword defaults so the
+        notebook API stays simple while advanced users can reproduce or test
+        alternative pretrained configurations without editing the source.
+        """
         if image is None:
             image = self.image
         if image is None:
             raise ValueError("image must be provided.")
-        
-        name = self.name
-        
-        images = [_copy_without_adsorbates(image)]
-        
-        # hyperparameters
-        atom_fea_len = 150
-        n_conv = 5
-        h_fea_len = 128
-        n_h = 2
-        
-        pe = []
-        vws = []
-        
-        V_dic = {'Sc': 24.724542268797304, 'Ti': 17.424646217258488, 'V': 13.917982774094817, 'Cr': 11.863283203031445, 
-                 'Mn': 10.785494076584158, 'Fe': 11.451083083113335, 'Co': 10.398800712477017, 'Ni': 10.916490557546439, 
-                 'Cu': 12.14350679198855, 'Y': 32.44397679442938, 'Zr': 23.170475005920792, 'Nb': 18.71258535775407, 
-                 'Mo': 16.197202890320533, 'Ru': 14.229567963011105, 'Rh': 14.229567963011105, 'Pd': 15.35668980826143, 
-                 'Ag': 17.969127631160283, 'Ta': 18.71258535775407, 'W': 16.54181279434536, 'Re': 14.70561133998898, 
-                 'Os': 14.229567963011105, 'Ir': 14.545769144994983, 'Pt': 15.857412626116277, 'Au': 18.153110451663995}
-        
-        PE_dic = {'Sc':2.2603424, 'Ti':2.440124875909091, 'V':2.6619930170731707, 'Cr':3.6188933459259256, 
-                  'Mn':4.265695346153847, 'Fe':2.9840186344444444, 'Co':1.7877074285714285, 'Ni':0.19241192499999998, 
-                  'Cu':0, 'Y':1.9629624225, 'Zr':1.7412473684210525, 'Nb':1.544762289473684, 'Mo':2.9535343183673466, 
-                  'Tc':2.330626157894737, 'Ru':1.4199372666666668, 'Rh':1.1374149333333332, 'Pd':1.03267305, 
-                  'Ag':0, 'Hf':3.3832650593749998, 'Ta':2.5171466666666666,  'W':3.9899073974358963, 
-                  'Re':3.3005202272727274, 'Os':1.9706242272727275, 'Ir':1.8323957333333332, 'Pt':0.767994218, 'Au':0}
 
-        for image in images:
-            sym = image.get_chemical_symbols()
-            pe_tmp = _values_for_symbols(sym, PE_dic, "promotion energy")
-            pe.append(pe_tmp)
-            vws_tmp = _values_for_symbols(sym, V_dic, "Wigner-Seitz volume")
-            vws.append(vws_tmp)
-        
-        pe = np.array(pe, dtype=object)
-        vws = np.array(vws, dtype=object)
-        
-        index = []
-        n = 0
-        for p in pe:
-            index += [np.arange(n, n+len(p))]
-            n = n + len(p)
-        
-        ech = []
-        parms = []
-        for model_inx in range(0,10):
-            # set up model
-            model = Regression(images=images,
-                               data_format='test',
-                               phys_model='cohesive_energy',
-                               optim_algorithm='AdamW',
-                               batch_size=1024,
-                               model_inx=model_inx,
-                               
-                               # hyperparameter
-                               atom_fea_len=atom_fea_len,
-                               n_conv=n_conv,
-                               h_fea_len=h_fea_len,
-                               n_h=n_h,
-                               
-                               # user-defined constants, additional targets, etc.
-                               constant_1=pe,
-                               constant_2=vws,
-                               constant_3=index,
-                               )
-            
-            output, parm = model.predict()
-            
-            ech += [np.average(output.detach().cpu().numpy())]
-            parms += [np.concatenate((np.atleast_1d(np.average(output.detach().cpu().numpy())),
-                      np.average(parm.detach().cpu().numpy(), axis=1)))]
-        
-        ech = np.array(ech)
-        
-        if return_all_parm == False:
+        images = [copy_without_adsorbates(image)]
+        pe, vws, atom_indices = self._build_cohesive_constants(images)
+
+        ensemble_results = [
+            self._predict_single_model(
+                images=images,
+                model_inx=model_inx,
+                batch_size=batch_size,
+                atom_fea_len=atom_fea_len,
+                n_conv=n_conv,
+                h_fea_len=h_fea_len,
+                n_h=n_h,
+                pe=pe,
+                vws=vws,
+                atom_indices=atom_indices,
+            )
+            for model_inx in range(n_ensemble_models)
+        ]
+
+        ech = np.array([result[0] for result in ensemble_results])
+        parms = np.vstack([result[1] for result in ensemble_results])
+
+        if not return_all_parm:
             print("Cohesive Energy")
             print("=" * 45)
             print(f"{'Material':<15} {'Cohesive Energy (eV/atom)':>20}")
             print("-" * 45)
-            print(f"{name:<15} {np.average(ech):>20.2f} ± {np.std(ech):<20.2f}")
+            print(f"{self.name:<15} {np.average(ech):>20.2f} ± {np.std(ech):<20.2f}")
             return ech
-        else:
-            return np.vstack(parms)
+        return parms
 
+    @staticmethod
+    def _build_cohesive_constants(images):
+        """Return promotion energies, Wigner-Seitz volumes, and atom indices."""
+        pe = []
+        vws = []
+        atom_indices = []
+        offset = 0
+
+        for structure in images:
+            symbols = structure.get_chemical_symbols()
+            pe_values = cohesive_constant_for_symbols(symbols, "promotion_energy")
+            vws_values = cohesive_constant_for_symbols(symbols, "wigner_seitz_volume")
+
+            pe.append(pe_values)
+            vws.append(vws_values)
+            atom_indices.append(np.arange(offset, offset + len(symbols)))
+            offset += len(symbols)
+
+        return np.array(pe, dtype=object), np.array(vws, dtype=object), atom_indices
+
+    @staticmethod
+    def _average_tensor(tensor):
+        """Return the scalar mean of a tensor as a NumPy/Python value."""
+        return np.average(tensor.detach().cpu().numpy())
+
+    def _predict_single_model(self,
+                              images,
+                              model_inx,
+                              batch_size,
+                              atom_fea_len,
+                              n_conv,
+                              h_fea_len,
+                              n_h,
+                              pe,
+                              vws,
+                              atom_indices):
+        """Evaluate one ensemble member and return scalar energy + SHAP terms."""
+        model = Regression(
+            images=images,
+            data_format='test',
+            phys_model='cohesive_energy',
+            optim_algorithm='AdamW',
+            batch_size=batch_size,
+            model_inx=model_inx,
+            atom_fea_len=atom_fea_len,
+            n_conv=n_conv,
+            h_fea_len=h_fea_len,
+            n_h=n_h,
+            constant_1=pe,
+            constant_2=vws,
+            constant_3=atom_indices,
+        )
+
+        output, parm = model.predict()
+        energy = self._average_tensor(output)
+        contribution_terms = np.average(parm.detach().cpu().numpy(), axis=1)
+        return energy, np.concatenate((np.atleast_1d(energy), contribution_terms))
 
     def ech_shap(self,
                  inp_shap):
@@ -157,174 +197,101 @@ class CohesiveEnergy:
                  ref_image,
                  target_image):
         
-        ref_image = _copy_without_adsorbates(ref_image)
-        target_image = _copy_without_adsorbates(target_image)
-        
+        ref_image = copy_without_adsorbates(ref_image)
+        target_image = copy_without_adsorbates(target_image)
+
         predicted_parameter_reference = self.predict(ref_image,
                                                      return_all_parm=True)
+
+        predicted_parameter_target = self.predict(target_image,
+                                                  return_all_parm=True)
         
-        predicted_parameter_target  = self.predict(target_image,
-                                                   return_all_parm=True)
-        
-        shap_promotion = []
-        shap_renormalization = []
-        shap_s_band = []
-        shap_d_band = []
+        component_shap_values = []
         predicted_ech_reference = []
         predicted_ech_target = []
-        
-        for i in range(0,10):
-            inp_shap_reference = np.atleast_2d(predicted_parameter_reference[i,1:])
-            
-            explainer = shap.Explainer(self.ech_shap,
-                                       inp_shap_reference)
-            
-            inp_shap_target = np.atleast_2d(predicted_parameter_target[i,1:])
 
-            shap_values = explainer(inp_shap_target).values
-            
-            shap_promotion += [shap_values[:,0]]
-            shap_renormalization += [shap_values[:,1]]
-            shap_s_band += [shap_values[:,2]]
-            shap_d_band += [shap_values[:,3]]
-            
-            predicted_ech_reference += [predicted_parameter_reference[i][0]]
-            predicted_ech_target += [predicted_parameter_target[i][0]]
-        
-        return np.vstack((np.array(predicted_ech_reference).flatten(),
-                          np.array(predicted_ech_target).flatten(),
-                          np.array(shap_promotion).flatten(),
-                          np.array(shap_renormalization).flatten(),
-                          np.array(shap_s_band).flatten(),
-                          np.array(shap_d_band).flatten()))
+        for ref_params, target_params in zip(predicted_parameter_reference,
+                                             predicted_parameter_target):
+            explainer = shap.Explainer(self.ech_shap,
+                                       np.atleast_2d(ref_params[1:]))
+            shap_values = explainer(np.atleast_2d(target_params[1:])).values
+
+            component_shap_values.append(shap_values.reshape(-1))
+            predicted_ech_reference.append(ref_params[0])
+            predicted_ech_target.append(target_params[0])
+
+        component_shap_values = np.asarray(component_shap_values)
+
+        return np.vstack((
+            np.asarray(predicted_ech_reference).flatten(),
+            np.asarray(predicted_ech_target).flatten(),
+            component_shap_values[:, 0].flatten(),
+            component_shap_values[:, 1].flatten(),
+            component_shap_values[:, 2].flatten(),
+            component_shap_values[:, 3].flatten(),
+        ))
     
     def explain_shap(self,
                      ref_image=None,
                      ref_name='Reference',
                      plot_name='shap',
                      save_fig='png'):
-        
+        """Create a compact SHAP waterfall plot for cohesive-energy terms."""
         target_image = self.image
         target_name = self.name
-        
-        rcParams['ps.useafm'] = True
-        plt.rc('font',**{'family':'sans-serif','sans-serif':['DejaVu Sans']})
-        rcParams['pdf.fonttype'] = 42
-        rcParams['errorbar.capsize'] = 4.0
-        mpl.rcParams['ytick.major.width'] = 0.5
-        mpl.rcParams['ytick.minor.width'] = 0.5
-        mpl.rcParams['xtick.major.width'] = 0.5
-        mpl.rcParams['xtick.minor.width'] = 0.5
-        matplotlib.rc('xtick.major', size=4)
-        matplotlib.rc('xtick.minor', size=2)
-        matplotlib.rc('ytick.major', size=4)
-        matplotlib.rc('ytick.minor', size=2)
-        matplotlib.rc('lines', linewidth = 0.5)
-        matplotlib.rc('lines', markeredgewidth=0.5)
-        matplotlib.rc('font', size=7)
-        plt.rcParams['axes.linewidth'] = 0.5
-        
-        fig, ax = plt.subplots()
-        fig.set_size_inches(3.375*2.0, 3.375)
-        
-        shap = self.gen_shap(ref_image,
-                             target_image)
-        
-        shap = np.average(shap, axis=1)
-        
-        idx = np.argsort(shap[2:])
-        
-        labels = [r'$E_{prom}$',
-                  r'$E_{renorm}$',
-                  r'$E_{s}$',
-                  r'$E_{d}$']
-        
-        labels = [labels[i] for i in idx]
-        
-        idx = np.concatenate(([0,1], idx+2))
-        shap = shap[idx]
-        
-        dx4 = shap[2]
-        dx3 = shap[3]
-        dx2 = shap[4]
-        dx1 = shap[5]
-        
-        x4 = shap[0]
-        x3 = x4 + dx4
-        x2 = x3 + dx3
-        x1 = x2 + dx2
-        
-        c4 = (shap[2] < 0) * 'red' + (shap[2] >= 0) * 'blue'
-        c3 = (shap[3] < 0) * 'red' + (shap[3] >= 0) * 'blue'
-        c2 = (shap[4] < 0) * 'red' + (shap[4] >= 0) * 'blue'
-        c1 = (shap[5] < 0) * 'red' + (shap[5] >= 0) * 'blue'
-        
-        ax.arrow(x=x4, y=4, dx=dx4, dy=0, color=c4, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx4),
-                 length_includes_head=True)
-        ax.arrow(x=x3, y=3, dx=dx3, dy=0, color=c3, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx3),
-                 length_includes_head=True)
-        ax.arrow(x=x2, y=2, dx=dx2, dy=0, color=c2, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx2),
-                 length_includes_head=True)
-        ax.arrow(x=x1, y=1, dx=dx1, dy=0, color=c1, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx1),
-                 length_includes_head=True)
-        
-        ax.set_ylim([0.5, 5.5])
-        
-        plt.yticks([4,3,2,1], labels)
-        
-        sym_4 = (shap[2] < 0) * '-' + (shap[2] >= 0) * '+'
-        sym_3 = (shap[3] < 0) * '-' + (shap[3] >= 0) * '+'
-        sym_2 = (shap[4] < 0) * '-' + (shap[4] >= 0) * '+'
-        sym_1 = (shap[5] < 0) * '-' + (shap[5] >= 0) * '+'
-        
-        ax.annotate(sym_4 + '{:.2f}'.format(round(np.abs(shap[2]), 4)),
-                    xy=(-0.12, 4.00), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c4)
-        ax.annotate(sym_3 + '{:.2f}'.format(round(np.abs(shap[3]), 4)),
-                    xy=(-0.12, 3.00), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c3)
-        ax.annotate(sym_2 + '{:.2f}'.format(round(np.abs(shap[4]), 4)),
-                    xy=(-0.12, 2.00), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c2)
-        ax.annotate(sym_1 + '{:.2f}'.format(round(np.abs(shap[5]), 4)),
-                    xy=(-0.12, 1.00), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c1)
-        
+        if target_image is None:
+            raise ValueError("target image must be provided through self.image.")
+
+        set_publication_style()
+        fig, ax = plt.subplots(figsize=(3.375 * 2.0, 3.375))
+
+        shap_matrix = self.gen_shap(ref_image, target_image)
+        shap_mean = np.average(shap_matrix, axis=1)
+
+        base_value = shap_mean[0]
+        target_value = shap_mean[1]
+        contributions = shap_mean[2:]
+        labels = np.array([r'$E_{prom}$', r'$E_{renorm}$', r'$E_{s}$', r'$E_{d}$'])
+
+        order = np.argsort(contributions)
+        contributions = contributions[order]
+        labels = labels[order]
+
+        starts = base_value + np.r_[0.0, np.cumsum(contributions[:-1])]
+        y_positions = np.arange(len(contributions), 0, -1)
+        colors = [signed_color(value) for value in contributions]
+
+        for y, start, contribution, color in zip(y_positions, starts, contributions, colors):
+            ax.arrow(x=start, y=y, dx=contribution, dy=0, color=color,
+                     width=1.0 / 3.0, head_width=1.0 / 3.0,
+                     head_length=0.15 * abs(contribution),
+                     length_includes_head=True)
+            ax.annotate(signed_label(contribution),
+                        xy=(-0.12, y), xycoords=('axes fraction', 'data'),
+                        ha='center', va='center', color=color)
+
+        ax.set_ylim([0.5, len(contributions) + 1.5])
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(labels)
         ax.set_xlabel(r'$E_{Cohesive}$ (eV/atom)')
         ax.spines[['left', 'right', 'top']].set_visible(False)
-        
         ax.tick_params('y', length=0, width=0, which='major')
-        
-        ax.plot([x4, x4],[6, 0.5],'--', color='gray', linewidth=1)
-        
-        ax.plot([x3, x3], [4 + 1.0 / 3.0, 3 - 1.0 / 3.0],'--', color='gray',
-                linewidth=1)
-        ax.plot([x2, x2], [3 + 1.0 / 3.0, 2 - 1.0 / 3.0],'--', color='gray',
-                linewidth=1)
-        ax.plot([x1, x1], [2 + 1.0 / 3.0, 1 - 1.0 / 3.0],'--', color='gray',
-                linewidth=1)
-        
-        ax.plot([x1 + dx1, x1 + dx1],[6, 0.5],'--', color='orange',
-                linewidth=1)
-        
-        ax.annotate(ref_name + '\n{:.2f}'.format(round(x4, 4)),
-                    xy=(x4, 1.15), xycoords=('data', 'axes fraction'),
-                    ha='center', va='center', color='gray')
-        ax.annotate(target_name + '\n{:.2f}'.format(round(x1 + dx1, 4)),
-                    xy=(x1 + dx1, 1.05), xycoords=('data', 'axes fraction'),
-                    ha='center', va='center', color='orange')
-        
-        fig.tight_layout()
-        
-        if save_fig == 'png':
-            fig.savefig(plot_name + '.png', bbox_inches='tight', dpi=600)
-        elif save_fig == 'pdf':
-            fig.savefig(plot_name + '.pdf', bbox_inches='tight')
 
+        ax.plot([base_value, base_value], [len(contributions) + 2, 0.5], '--', color='gray', linewidth=1)
+        for start, y in zip(starts[1:], y_positions[:-1]):
+            ax.plot([start, start], [y + 1.0 / 3.0, y - 1 - 1.0 / 3.0], '--', color='gray', linewidth=1)
+
+        ax.plot([target_value, target_value], [len(contributions) + 2, 0.5], '--', color='orange', linewidth=1)
+        ax.annotate(f"{ref_name}\n{base_value:.2f}",
+                    xy=(base_value, 1.15), xycoords=('data', 'axes fraction'),
+                    ha='center', va='center', color='gray')
+        ax.annotate(f"{target_name}\n{target_value:.2f}",
+                    xy=(target_value, 1.05), xycoords=('data', 'axes fraction'),
+                    ha='center', va='center', color='orange')
+
+        fig.tight_layout()
+        save_figure(fig, plot_name, save_fig)
+        return fig, ax
 
 '''
 collection of tight-binding models.
@@ -336,109 +303,55 @@ newns_anderson:
 class TightBinding:
 
     def __init__(self, model_name, main_target, **kwargs):
-        # Initialize the class
-        if model_name == 'cohesive_energy':
-            self.model_num_input = 6
-            
-            cuda = torch.cuda.is_available()
-            
-            # target(s)
-            root_lamb = 0.1
-            
-            main_target = np.reshape(main_target,(-1,1))
-            
-            error_alpha = np.zeros((len(main_target),1))
-            error_beta = np.zeros((len(main_target),1))
-            error_ns = np.zeros((len(main_target),1))
-            error_nd = np.zeros((len(main_target),1))
-            error_w = np.zeros((len(main_target),1))
-            
-            error_alpha = np.reshape(error_alpha,(-1,1))
-            error_beta = np.reshape(error_beta,(-1,1))
-            error_ns = np.reshape(error_ns,(-1,1))
-            error_nd = np.reshape(error_nd,(-1,1))
-            error_w = np.reshape(error_w,(-1,1))
-                        
-            self.target = np.hstack((main_target,
-                                     error_alpha,
-                                     error_beta,
-                                     error_ns,
-                                     error_nd,
-                                     error_w))
-            
-            # Initialize the class
-            
-            pe = kwargs['constant_1']
-            vws = kwargs['constant_2']
-            index = kwargs['constant_3']
-            
-            pe = np.array([item for sublist in pe for item in sublist])
-            vws = np.array([item for sublist in vws for item in sublist])
-            index = np.array([item for sublist in index for item in sublist])
+        """Initialize the cohesion-theory module.
 
-            pe = torch.from_numpy(pe).type(torch.FloatTensor)
-            vws = torch.from_numpy(vws).type(torch.FloatTensor)
-            index = torch.from_numpy(index).type(torch.FloatTensor)
-            
-            if cuda:
-                pe = pe.cuda()
-                vws = vws.cuda()
-                index = index.cuda()
-            
-            self.pe = pe
-            self.vws = vws
-            self.index = index
-            self.cuda = cuda
-            self.root_lamb = root_lamb
-    
+        ``main_target`` is kept for compatibility with the original training
+        code.  During inference the auxiliary targets are zero-filled because
+        only the checkpointed model outputs are used.
+        """
+        if model_name != 'cohesive_energy':
+            raise ValueError(f"Unsupported tight-binding model: {model_name}")
+
+        self.model_num_input = 6
+        self.device = torch_device()
+        self.cuda = self.device.type == 'cuda'
+        self.root_lamb = 0.1
+
+        main_target = np.asarray(main_target, dtype=np.float32).reshape(-1, 1)
+        auxiliary_targets = np.zeros((len(main_target), 5), dtype=np.float32)
+        self.target = np.hstack((main_target, auxiliary_targets))
+
+        self.pe = as_float_tensor(flatten_nested(kwargs['constant_1']), self.device)
+        self.vws = as_float_tensor(flatten_nested(kwargs['constant_2']), self.device)
+        self.index = as_float_tensor(flatten_nested(kwargs['constant_3']), self.device)
+
     def cohesive_energy(self, namodel_in, dos_source, target, **kwargs):
-        
-        model_e_ren = namodel_in[:,0]
-        model_alpha = torch.nn.functional.softplus(namodel_in[:,1])
-        model_beta = torch.nn.functional.softplus(namodel_in[:,2])
-        model_ns = torch.nn.functional.softplus(namodel_in[:,3])
-        model_nd = torch.nn.functional.softplus(namodel_in[:,4])
-        model_w = torch.nn.functional.softplus(namodel_in[:,5])
-        
-        idx = kwargs['crys_idx']
-        
-        atom_index = kwargs['constant_3']
-        catagory = kwargs['catagory']
-        
-        pe = torch.stack([self.pe[int(idx_map)] for idx_map in atom_index], dim=0)
-        vws = torch.stack([self.vws[int(idx_map)] for idx_map in atom_index], dim=0)
-        
-        if self.cuda:
-            atom_index = atom_index.cuda()
-        
-        parm = torch.stack((atom_index,
-                            model_e_ren,
-                            model_alpha,
-                            model_beta,
-                            model_ns,
-                            model_nd,
-                            model_w)).T
-        
-        h_bar = 1.0545718e-34
-        m_ele = 9.10938356e-31
-        j_to_ev = 6.242e18
-        
-        par = 2.1880420859580444e-19 * (1/vws)**(2.0/3.0)
-        
-        model_energy = (pe
-                        + model_e_ren
-                        + par * model_alpha*(model_ns)**(2.0/3.0)
-                        + model_beta*model_w/20*model_nd*(model_nd-10))
-        
-        idxs = [atom_index[idx_map] for idx_map in idx]
-        ans = model_energy.view(len(model_energy),1,-1)
-        
-        parm = torch.stack((pe,
-                            model_e_ren,
-                            par * model_alpha*(model_ns)**(2.0/3.0),
-                            model_beta*model_w/20*model_nd*(model_nd-10)))
-        
-        return torch.flatten(ans[torch.Tensor.int(idxs[0])]), parm
+        """Compute cohesive-energy contributions from neural state variables."""
+        del dos_source, target  # Inference-only arguments kept for API compatibility.
+
+        e_ren = namodel_in[:, 0]
+        alpha, beta, ns, nd, width = [
+            torch.nn.functional.softplus(namodel_in[:, idx])
+            for idx in range(1, 6)
+        ]
+
+        atom_index = kwargs['constant_3'].to(device=self.device, dtype=torch.long)
+        structure_atom_indices = kwargs['crys_idx'][0].to(device=self.device, dtype=torch.long)
+
+        pe = self.pe[atom_index]
+        vws = self.vws[atom_index]
+
+        conduction_term = 2.1880420859580444e-19 * (1.0 / vws) ** (2.0 / 3.0)
+        conduction_energy = conduction_term * alpha * ns ** (2.0 / 3.0)
+        d_band_energy = beta * width / 20.0 * nd * (nd - 10.0)
+
+        site_energy = pe + e_ren + conduction_energy + d_band_energy
+        output = site_energy[structure_atom_indices].flatten()
+
+        # Rows are the physically interpretable contribution terms used by SHAP.
+        parm = torch.stack((pe, e_ren, conduction_energy, d_band_energy))
+        return output, parm
+
 
 class Regression:
     def __init__(self,
@@ -473,7 +386,8 @@ class Regression:
         TightBinding.__init__(self, phys_model, main_target, **kwargs)
         
         # initial settings
-        cuda = torch.cuda.is_available()
+        device = torch_device()
+        cuda = device.type == 'cuda'
         collate_fn = self.collate_pool
         
         # calculate graph features (Voronoi descriptor)
@@ -496,10 +410,10 @@ class Regression:
         idx_images = np.arange(len(atom_fea))
         
         # set up dataset and loaders
-        dataset = [((torch.Tensor(atom_fea[i]),
-                     torch.Tensor(nbr_fea[i]),
+        dataset = [((torch.as_tensor(atom_fea[i], dtype=torch.float32),
+                     torch.as_tensor(nbr_fea[i], dtype=torch.float32),
                      torch.LongTensor(nbr_fea_idx[i])),
-                    torch.tensor(np.array(self.target[i])),
+                    torch.as_tensor(np.array(self.target[i]), dtype=torch.float32),
                     idx_images[i],
                     kwargs['constant_1'][i],
                     kwargs['constant_2'][i],
@@ -534,9 +448,9 @@ class Regression:
                                     idx_val_fold=model_inx,   # Add these
                                     idx_test_fold=model_inx) # Add these
         
-        if cuda:
-            model.cuda()
+        model.to(device)
         
+        self.device = device
         self.cuda = cuda
         self.phys_model = phys_model
         self.train_loader = train_loader
@@ -548,15 +462,11 @@ class Regression:
 
     def predict(self, **kwargs):
         # test best model
-        if self.cuda:
-            best_checkpoint = torch.load('./data/pretrained/cohesive_energy/model_' + str(self.model_inx) + '.pth.tar')
-        else:
-            best_checkpoint = torch.load('./data/pretrained/cohesive_energy/model_' + str(self.model_inx) + '.pth.tar', map_location=torch.device('cpu'))
-        
-        self.model.load_state_dict(best_checkpoint['state_dict'])
-        
-        if os.path.exists('tinnet_output.db'):
-            os.remove('tinnet_output.db')
+        load_checkpoint_state(
+            self.model,
+            pretrained_path('cohesive_energy', f'model_{self.model_inx}.pth.tar'),
+            torch_device(),
+        )
         
         output, parm \
             = self.eval_model(catagory='test',
@@ -567,73 +477,59 @@ class Regression:
         return output, parm
     
     def eval_model(self, catagory, data_loader, save_outputs=False, **kwargs):
-        # switch to evaluate mode
+        """Evaluate the loaded checkpoint on a DataLoader."""
+        del save_outputs
         self.model.eval()
-        
-        for i, (input,
-                target,
-                batch_cif_ids,
-                constant_1,
-                constant_2,
-                constant_3) in enumerate(data_loader):
-            
-            with torch.no_grad():
-                if self.cuda:
-                    input_var = (Variable(input[0].cuda(non_blocking=True)),
-                                 Variable(input[1].cuda(non_blocking=True)),
-                                 input[2].cuda(non_blocking=True),
-                                 [crys_idx.cuda(non_blocking=True)
-                                  for crys_idx in input[3]],
-                                 catagory)
-                else:
-                    input_var = (Variable(input[0]),
-                                 Variable(input[1]),
-                                 input[2],
-                                 input[3],
-                                 catagory)
-                
-                if self.cuda:
-                    target_var = Variable(target.cuda(non_blocking=True))
-                else:
-                    target_var = Variable(target)
-            
-            # compute output
-            cnn_output = self.model(*input_var)
-            
-            if self.phys_model =='cohesive_energy':
-            	if self.cuda:
-                    output, parm = TightBinding.cohesive_energy(
-                        self,
-                        cnn_output,
-                        dos_source='model',
-                        target=target_var,
-                        **dict(**kwargs,
-                               crys_idx=[crys_idx.cuda(non_blocking=True)
-                                  for crys_idx in input[3]],
-                               constant_1=constant_1,
-                               constant_2=constant_2,
-                               constant_3=constant_3,
-                               catagory=catagory,
-                               idx_val_fold=self.model_inx,
-                               idx_test_fold=self.model_inx))
-            	else:
-                    output, parm = TightBinding.cohesive_energy(
-                        self,
-                        cnn_output,
-                        dos_source='model',
-                        target=target_var,
-                        **dict(**kwargs,
-                               crys_idx=[crys_idx
-                                  for crys_idx in input[3]],
-                               constant_1=constant_1,
-                               constant_2=constant_2,
-                               constant_3=constant_3,
-                               catagory=catagory,
-                               idx_val_fold=self.model_inx,
-                               idx_test_fold=self.model_inx))
-        
+
+        output = parm = None
+        with torch.no_grad():
+            for batch in data_loader:
+                (inputs, target, batch_cif_ids, constant_1, constant_2, constant_3) = batch
+                atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx = self._move_inputs_to_device(inputs)
+                target_var = target.to(self.device, non_blocking=True)
+
+                cnn_output = self.model(
+                    atom_fea,
+                    nbr_fea,
+                    nbr_fea_idx,
+                    crystal_atom_idx,
+                    catagory,
+                )
+
+                if self.phys_model != 'cohesive_energy':
+                    raise ValueError(f"Unsupported physical model: {self.phys_model}")
+
+                output, parm = TightBinding.cohesive_energy(
+                    self,
+                    cnn_output,
+                    dos_source='model',
+                    target=target_var,
+                    **dict(
+                        kwargs,
+                        crys_idx=crystal_atom_idx,
+                        constant_1=constant_1.to(self.device, non_blocking=True),
+                        constant_2=constant_2.to(self.device, non_blocking=True),
+                        constant_3=constant_3.to(self.device, non_blocking=True),
+                        catagory=catagory,
+                        idx_val_fold=self.model_inx,
+                        idx_test_fold=self.model_inx,
+                    ),
+                )
+
+        if output is None or parm is None:
+            raise RuntimeError("DataLoader produced no batches.")
         return output, parm
-    
+
+    def _move_inputs_to_device(self, inputs):
+        """Move graph tensors and crystal index maps to the model device."""
+        atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx = inputs
+        return (
+            atom_fea.to(self.device, non_blocking=True),
+            nbr_fea.to(self.device, non_blocking=True),
+            nbr_fea_idx.to(self.device, non_blocking=True),
+            [idx.to(self.device, non_blocking=True) for idx in crystal_atom_idx],
+        )
+
     def get_train_val_test_loader(self,
                                   dataset,
                                   idx_val_fold=0,
@@ -743,44 +639,34 @@ class Regression:
         crystal_atom_idx = []
         batch_target = []
         batch_cif_ids = []
+        constants = {"constant_1": [], "constant_2": [], "constant_3": []}
         base_idx = 0
-        batch_constant_1 = []
-        batch_constant_2 = []
-        batch_constant_3 = []
-        
-        for i, ((atom_fea, nbr_fea, nbr_fea_idx),
-                target,
-                cif_id,
-                constant_1,
-                constant_2,
-                constant_3)\
-                in enumerate(dataset_list):
-            n_i = atom_fea.shape[0]  # number of atoms for this crystal
+
+        for (atom_fea, nbr_fea, nbr_fea_idx), target, cif_id, constant_1, constant_2, constant_3 in dataset_list:
+            n_atoms = atom_fea.shape[0]
+            atom_offset = torch.arange(n_atoms, dtype=torch.long) + base_idx
+
             batch_atom_fea.append(atom_fea)
             batch_nbr_fea.append(nbr_fea)
-            batch_nbr_fea_idx.append(nbr_fea_idx+base_idx)
-            new_idx = torch.LongTensor(np.arange(n_i)+base_idx)
-            crystal_atom_idx.append(new_idx)
+            batch_nbr_fea_idx.append(nbr_fea_idx + base_idx)
+            crystal_atom_idx.append(atom_offset)
             batch_target.append(target)
             batch_cif_ids.append(cif_id)
-            base_idx += n_i
-            batch_constant_1.append(constant_1)
-            batch_constant_2.append(constant_2)
-            batch_constant_3.append(constant_3)
-        
-        batch_constant_1 = torch.Tensor([item for sublist in batch_constant_1 for item in sublist])
-        batch_constant_2 = torch.Tensor([item for sublist in batch_constant_2 for item in sublist])
-        batch_constant_3 = torch.Tensor([item for sublist in batch_constant_3 for item in sublist])
-        
-        return (torch.cat(batch_atom_fea, dim=0),
-                torch.cat(batch_nbr_fea, dim=0),
-                torch.cat(batch_nbr_fea_idx, dim=0),
-                crystal_atom_idx),\
-            torch.stack(batch_target, dim=0),\
-            batch_cif_ids,\
-            batch_constant_1,\
-            batch_constant_2,\
-            batch_constant_3,
+            constants["constant_1"].append(constant_1)
+            constants["constant_2"].append(constant_2)
+            constants["constant_3"].append(constant_3)
+            base_idx += n_atoms
+
+        batch_constant_1 = flatten_nested(constants["constant_1"])
+        batch_constant_2 = flatten_nested(constants["constant_2"])
+        batch_constant_3 = flatten_nested(constants["constant_3"])
+
+        return (
+            torch.cat(batch_atom_fea, dim=0),
+            torch.cat(batch_nbr_fea, dim=0),
+            torch.cat(batch_nbr_fea_idx, dim=0),
+            crystal_atom_idx,
+        ), torch.stack(batch_target, dim=0), batch_cif_ids, batch_constant_1, batch_constant_2, batch_constant_3
 
 
 class ConvLayer(nn.Module):
@@ -820,9 +706,9 @@ class ConvLayer(nn.Module):
         Parameters
         ----------
 
-        atom_in_fea: Variable(torch.Tensor) shape (N, atom_fea_len)
+        atom_in_fea: (torch.Tensor) shape (N, atom_fea_len)
           Atom hidden features before convolution
-        nbr_fea: Variable(torch.Tensor) shape (N, M, nbr_fea_len)
+        nbr_fea: (torch.Tensor) shape (N, M, nbr_fea_len)
           Bond features of each atom's M neighbors
         nbr_fea_idx: torch.LongTensor shape (N, M)
           Indices of M neighbors of each atom
@@ -830,7 +716,7 @@ class ConvLayer(nn.Module):
         Returns
         -------
 
-        atom_out_fea: nn.Variable shape (N, atom_fea_len)
+        atom_out_fea: torch.Tensor shape (N, atom_fea_len)
           Atom hidden features after convolution
 
         '''
@@ -908,9 +794,9 @@ class CrystalGraphConvNet(nn.Module):
         Parameters
         ----------
 
-        atom_fea: Variable(torch.Tensor) shape (N, orig_atom_fea_len)
+        atom_fea: (torch.Tensor) shape (N, orig_atom_fea_len)
           Atom features from atom type
-        nbr_fea: Variable(torch.Tensor) shape (N, M, nbr_fea_len)
+        nbr_fea: (torch.Tensor) shape (N, M, nbr_fea_len)
           Bond features of each atom's M neighbors
         nbr_fea_idx: torch.LongTensor shape (N, M)
           Indices of M neighbors of each atom
@@ -920,7 +806,7 @@ class CrystalGraphConvNet(nn.Module):
         Returns
         -------
 
-        prediction: nn.Variable shape (N, )
+        prediction: torch.Tensor shape (N, )
           Atom hidden features after convolution
 
         '''
@@ -976,7 +862,7 @@ class Voronoi:
         
         # Load superstructure of atom features
         if dict_atom_fea is None:
-            self.dict_atom_fea = self.dict_atom_fea_default()
+            self.dict_atom_fea = atom_features()
         else:
             self.dict_atom_fea = dict_atom_fea
         
@@ -1033,508 +919,3 @@ class Voronoi:
         
         return atom_fea, nbr_fea, nbr_fea_idx
 
-    def dict_atom_fea_default(self):
-        # Default superstructure of atom features
-        # Comes from Jeffrey C. Grossman, atom_init.json
-        atom_fea_dict = {
-            1: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            2: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0],
-            3: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0],
-            4: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            5: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            7: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            8: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            9: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            10: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            11: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            12: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            13: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            14: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            15: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            16: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            17: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            18: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            19: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            20: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            21: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            22: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            23: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            24: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            25: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            26: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            27: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            28: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            29: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            30: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            31: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            32: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            33: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            34: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            35: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            36: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            37: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            38: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            39: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            40: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            41: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            42: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            43: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            44: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            45: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            46: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            47: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            48: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            49: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            50: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            51: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            52: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            53: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            54: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            55: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            56: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            57: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            58: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            59: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            60: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            61: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            62: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            63: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            64: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            65: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            66: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            67: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            68: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            69: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            70: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            71: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            72: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            73: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            74: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            75: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            76: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            77: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            78: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            79: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            80: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            81: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            82: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            83: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            84: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            85: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            86: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            87: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            88: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            89: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            90: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            91: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            92: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            93: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            94: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            95: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            96: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            97: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            98: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            99: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            100: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}
-        return atom_fea_dict

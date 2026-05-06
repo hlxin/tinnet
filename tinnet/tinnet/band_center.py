@@ -1,33 +1,90 @@
 #!/usr/bin/env python
+"""TinNet d-band filling, center, and rectangular-width prediction.
+
+The implementation preserves the trained model architecture and equations while
+improving input validation, checkpoint loading, and plotting utilities.
+"""
 # This script is adapted from Xie's and Ulissi's scripts.
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pickle
 import shap
 import torch
 import torch.nn as nn
 
-from torch.autograd import Variable
-from ase import io
-from pylab import *
+try:
+    from .tinnet_utils import (
+        atom_features,
+        as_float_tensor,
+        material_properties,
+        as_long_tensor,
+        copy_without_adsorbates,
+        data_path,
+        load_checkpoint_state,
+        normalize_atom_index,
+        normalize_site_indices,
+        pretrained_path,
+        set_publication_style,
+        signed_label,
+        signed_color,
+        save_figure,
+        stack_scalar_parameters,
+        torch_device,
+        validate_atom_index,
+        values_for_symbols,
+    )
+except ImportError:  # Allows running this file directly during debugging.
+    from tinnet_utils import (
+        atom_features,
+        as_float_tensor,
+        material_properties,
+        as_long_tensor,
+        copy_without_adsorbates,
+        data_path,
+        load_checkpoint_state,
+        normalize_atom_index,
+        normalize_site_indices,
+        pretrained_path,
+        set_publication_style,
+        signed_label,
+        signed_color,
+        save_figure,
+        stack_scalar_parameters,
+        torch_device,
+        validate_atom_index,
+        values_for_symbols,
+    )
 
-
-def _copy_without_adsorbates(image):
-    """Return a copy of an ASE Atoms object with O/H adsorbates removed.
-
-    This avoids mutating the caller's structure during prediction or SHAP analysis.
-    """
-    clean_image = image.copy()
-    adsorbate_indices = [
-        i for i, atom in enumerate(clean_image) if atom.symbol in {"O", "H"}
-    ]
-    for i in sorted(adsorbate_indices, reverse=True):
-        del clean_image[i]
-    return clean_image
 
 
 class BandCenter:
+    """Predict d-band filling, center, and full rectangular width.
+
+    This class wraps an ensemble of pretrained TinNet checkpoints.  The public
+    notebook-facing API is kept compatible with the original implementation,
+    while the repeated feature-construction and SHAP logic is centralized into
+    reusable helper methods.
+    """
+
+    N_ENSEMBLE_MODELS = 10
+    MAX_NEIGHBORS = 86
+    REPEAT_TIMES = 11
+    NEIGHBOR_CUTOFF = 5.5
+
+    PROPERTY_INDEX = {
+        'filling': 0,
+        'center': 1,
+        'width': 2,
+    }
+
+    SHAP_LABELS = [
+        r'$(\alpha, \xi)$',
+        r'$d_{ij}$',
+        r'$\zeta$',
+        r'$(\lambda, r_{dj})$',
+        r'$(\beta, \Delta\chi)$',
+    ]
+
     def __init__(self,
                  image=None,
                  atom_inx=None,
@@ -36,644 +93,172 @@ class BandCenter:
                                    dmin=0,
                                    step=0.2,
                                    dict_atom_fea=None)
-        self.material_dict = Features.material_dict()
+        self.material_dict = material_properties()
         self.image = image
         self.atom_inx = atom_inx
         self.name = name
-    
+
+    # ------------------------------------------------------------------
+    # Public prediction API
+    # ------------------------------------------------------------------
     def predict(self,
+                image=None,
+                atom_inx=None,
                 return_all_parm=False):
-        
-        if self.image is None:
+        """Predict the d-band center for the configured atom site."""
+        input_image = self.image if image is None else image
+        site_index = self.atom_inx if atom_inx is None else atom_inx
+        if input_image is None:
             raise ValueError("image must be provided.")
-        if self.atom_inx is None:
+        if site_index is None:
             raise ValueError("atom_inx must be provided.")
 
-        input_image = _copy_without_adsorbates(self.image)
-        
-        atom_inx = self.atom_inx
-        system_name = self.name
-        if atom_inx + 1 > len(input_image):
-            raise IndexError(f"atom_inx={atom_inx} is outside the clean image with {len(input_image)} atoms.")
-        
-        enlarged_image = input_image.copy()
-        enlarged_atom_inx = len(enlarged_image)*60 + atom_inx
-        enlarged_image = enlarged_image.repeat((11,11,1))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 5.5))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        tabulated_filling_inf = self.material_dict[idx_sym]['bulk_filling']
-        tabulated_d_cen_inf = self.material_dict[idx_sym]['d_cen']
-        tabulated_full_width_inf = self.material_dict[idx_sym]['full_width']
-        
-        idx_rad = self.material_dict[idx_sym]['rd']
-        nbr_rad = np.array([self.material_dict[nbr_sym]['rd'] for nbr_sym in nbr_syms])
-        
-        vds = idx_rad**1.5 / nbr_dis**3.5
-        vdd = idx_rad**1.5 * nbr_rad**1.5 / nbr_dis**5.0
-        
-        v2ds = 9.9856 * vds**2.0 * 7.62**2
-        v2dd = 415.565 * vdd**2.0 * 7.62**2
-        
-        assert len(v2ds) <= 86
-        assert len(v2dd) <= 86
-        assert len(nbr_dis) <= 86
-        assert len(nbr_lists) <= 86
-        
-        tabulated_v2ds = np.pad(v2ds, [0, 86-len(v2ds)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_v2dd = np.pad(v2dd, [0, 86-len(v2dd)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_d_ij = np.pad(nbr_dis, [0, 86-len(nbr_dis)],
-                                mode='constant',
-                                constant_values=1E6)
-        
-        tabulated_nbr_idx = np.pad(nbr_lists, [0, 86-len(nbr_lists)],
-                                   mode='constant',
-                                   constant_values=1E6)
-        
-        (shorten_idx_syms,
-         shorten_nbr_syms,
-         shorten_atom_fea,
-         shorten_nbr_fea,
-         shorten_nbr_fea_idx,
-         tabulated_d_ij_sorted,
-         tabulated_nbr_index_sorted,
-         tabulated_v2dd_sorted,
-         tabulated_v2ds_sorted,
-         tabulated_padding_fillter) = self.descriptor.feas(input_image,
-                                                           enlarged_image,
-                                                           tabulated_nbr_idx,
-                                                           tabulated_d_ij,
-                                                           enlarged_atom_inx,
-                                                           tabulated_v2ds,
-                                                           tabulated_v2dd)
-        
-        shorten_tabulated_site_index = np.mod(enlarged_atom_inx,
-                                              len(input_image))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        # mulliken 1st nbr shell
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 1**0.5*np.sort(nbr_dis)[1]+0.01))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        idx_mulliken = (self.material_dict[idx_sym][b'IonizationPotential']
-                        + self.material_dict[idx_sym][b'ElectronAffinity']) / 2.0
-        
-        nbr_mulliken = np.array([self.material_dict[nbr_sym][b'IonizationPotential']
-                                 + self.material_dict[nbr_sym][b'ElectronAffinity']
-                                 for nbr_sym in nbr_syms]) / 2.0
-        
-        tabulated_mulliken = (idx_mulliken - np.prod(nbr_mulliken)
-                              **(1/len(nbr_mulliken)))
-        
-        ans = []
-        
-        for idx_model in range(0,10):
-            model = Prediction(shorten_atom_fea,
-                               shorten_nbr_fea,
-                               shorten_nbr_fea_idx,
-                               idx_model=idx_model,
-                               tabulated_filling_inf=tabulated_filling_inf,
-                               tabulated_d_cen_inf=tabulated_d_cen_inf,
-                               tabulated_padding_fillter=tabulated_padding_fillter,
-                               tabulated_full_width_inf=tabulated_full_width_inf,
-                               tabulated_mulliken=tabulated_mulliken,
-                               tabulated_site_index=shorten_tabulated_site_index,
-                               tabulated_v2dd=tabulated_v2dd_sorted,
-                               tabulated_v2ds=tabulated_v2ds_sorted)
-            
-            ans += [model.predict_properties(return_all_parm=return_all_parm)]
-        
-        if return_all_parm == False:
-            ans = np.stack(ans)[:,:,0]
-            mean_center = np.mean(ans[:, 1])   # d-band center
-            std_center = np.std(ans[:, 1])
-            print(f"band center of the atom (index {atom_inx}) of {system_name}: {mean_center:.2f} ± {std_center:.2f} eV")
-            return ans[:,1]
-        else:
-            nbr_rad = np.pad(nbr_rad,
-                             [0, 86-len(nbr_rad)],
-                             mode='constant',
-                             constant_values=0)
-            return (ans,
-                    np.concatenate(([idx_rad],
-                                    nbr_rad,
-                                    tabulated_d_ij_sorted,
-                                    [tabulated_d_cen_inf],
-                                    [tabulated_full_width_inf],
-                                    [tabulated_mulliken],
-                                    tabulated_padding_fillter[atom_inx])))
-    
+        result = self._predict_property(input_image,
+                                        site_index,
+                                        property_name='center',
+                                        return_all_parm=return_all_parm)
+        if return_all_parm:
+            return result
+
+        mean_center = np.mean(result)
+        std_center = np.std(result)
+        print(
+            f"band center of the atom (index {site_index}) of {self.name}: "
+            f"{mean_center:.2f} ± {std_center:.2f} eV"
+        )
+        return result
+
     def image2band_filling(self,
                            input_image,
                            atom_inx,
                            return_all_parm=False):
-        
-        assert atom_inx + 1 <= len(input_image)
-        
-        enlarged_image = input_image.copy()
-        enlarged_atom_inx = len(enlarged_image)*60 + atom_inx
-        enlarged_image = enlarged_image.repeat((11,11,1))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 5.5))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        tabulated_filling_inf = self.material_dict[idx_sym]['bulk_filling']
-        tabulated_d_cen_inf = self.material_dict[idx_sym]['d_cen']
-        tabulated_full_width_inf = self.material_dict[idx_sym]['full_width']
-        
-        idx_rad = self.material_dict[idx_sym]['rd']
-        nbr_rad = np.array([self.material_dict[nbr_sym]['rd'] for nbr_sym in nbr_syms])
-        
-        vds = idx_rad**1.5 / nbr_dis**3.5
-        vdd = idx_rad**1.5 * nbr_rad**1.5 / nbr_dis**5.0
-        
-        v2ds = 9.9856 * vds**2.0 * 7.62**2
-        v2dd = 415.565 * vdd**2.0 * 7.62**2
-        
-        assert len(v2ds) <= 86
-        assert len(v2dd) <= 86
-        assert len(nbr_dis) <= 86
-        assert len(nbr_lists) <= 86
-        
-        tabulated_v2ds = np.pad(v2ds, [0, 86-len(v2ds)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_v2dd = np.pad(v2dd, [0, 86-len(v2dd)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_d_ij = np.pad(nbr_dis, [0, 86-len(nbr_dis)],
-                                mode='constant',
-                                constant_values=1E6)
-        
-        tabulated_nbr_idx = np.pad(nbr_lists, [0, 86-len(nbr_lists)],
-                                   mode='constant',
-                                   constant_values=1E6)
-        
-        (shorten_idx_syms,
-         shorten_nbr_syms,
-         shorten_atom_fea,
-         shorten_nbr_fea,
-         shorten_nbr_fea_idx,
-         tabulated_d_ij_sorted,
-         tabulated_nbr_index_sorted,
-         tabulated_v2dd_sorted,
-         tabulated_v2ds_sorted,
-         tabulated_padding_fillter) = self.descriptor.feas(input_image,
-                                                           enlarged_image,
-                                                           tabulated_nbr_idx,
-                                                           tabulated_d_ij,
-                                                           enlarged_atom_inx,
-                                                           tabulated_v2ds,
-                                                           tabulated_v2dd)
-        
-        shorten_tabulated_site_index = np.mod(enlarged_atom_inx,
-                                              len(input_image))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        # mulliken 1st nbr shell
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 1**0.5*np.sort(nbr_dis)[1]+0.01))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        idx_mulliken = (self.material_dict[idx_sym][b'IonizationPotential']
-                        + self.material_dict[idx_sym][b'ElectronAffinity']) / 2.0
-        
-        nbr_mulliken = np.array([self.material_dict[nbr_sym][b'IonizationPotential']
-                                 + self.material_dict[nbr_sym][b'ElectronAffinity']
-                                 for nbr_sym in nbr_syms]) / 2.0
-        
-        tabulated_mulliken = (idx_mulliken - np.prod(nbr_mulliken)
-                              **(1/len(nbr_mulliken)))
-        
-        ans = []
-        
-        for idx_model in range(0,10):
-            model = Prediction(shorten_atom_fea,
-                               shorten_nbr_fea,
-                               shorten_nbr_fea_idx,
-                               idx_model=idx_model,
-                               tabulated_filling_inf=tabulated_filling_inf,
-                               tabulated_d_cen_inf=tabulated_d_cen_inf,
-                               tabulated_padding_fillter=tabulated_padding_fillter,
-                               tabulated_full_width_inf=tabulated_full_width_inf,
-                               tabulated_mulliken=tabulated_mulliken,
-                               tabulated_site_index=shorten_tabulated_site_index,
-                               tabulated_v2dd=tabulated_v2dd_sorted,
-                               tabulated_v2ds=tabulated_v2ds_sorted)
-            
-            ans += [model.predict_properties(return_all_parm=return_all_parm)]
-        
-        if return_all_parm == False:
-            ans = np.stack(ans)[:,:,0]
-            mean_filling = np.mean(ans[:, 0])  # d-band filling
-            std_filling = np.std(ans[:, 0])
-            print(f"band filling: {mean_filling:.6f} ± {std_filling:.6f}")
-            return ans[:,0]
-        else:
-            nbr_rad = np.pad(nbr_rad,
-                             [0, 86-len(nbr_rad)],
-                             mode='constant',
-                             constant_values=0)
-            return (ans,
-                    np.concatenate(([idx_rad],
-                                    nbr_rad,
-                                    tabulated_d_ij_sorted,
-                                    [tabulated_d_cen_inf],
-                                    [tabulated_full_width_inf],
-                                    [tabulated_mulliken],
-                                    tabulated_padding_fillter[atom_inx])))
+        """Predict d-band filling for a site in an ASE Atoms object."""
+        result = self._predict_property(input_image,
+                                        atom_inx,
+                                        property_name='filling',
+                                        return_all_parm=return_all_parm)
+        if not return_all_parm:
+            print(f"band filling: {np.mean(result):.6f} ± {np.std(result):.6f}")
+        return result
 
     def image2band_center(self,
                           image,
                           atom_inx,
                           return_all_parm=False):
-        
-        image = _copy_without_adsorbates(image)
-        
-        if atom_inx + 1 > len(image):
-            raise IndexError(f"atom_inx={atom_inx} is outside the clean image with {len(image)} atoms.")
-        
-        enlarged_image = image.copy()
-        enlarged_atom_inx = len(enlarged_image)*60 + atom_inx
-        enlarged_image = enlarged_image.repeat((11,11,1))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 5.5))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        tabulated_filling_inf = self.material_dict[idx_sym]['bulk_filling']
-        tabulated_d_cen_inf = self.material_dict[idx_sym]['d_cen']
-        tabulated_full_width_inf = self.material_dict[idx_sym]['full_width']
-        
-        idx_rad = self.material_dict[idx_sym]['rd']
-        
-        nbr_rad = np.array([self.material_dict[nbr_sym]['rd'] for nbr_sym in nbr_syms])
-        
-        vds = idx_rad**1.5 / nbr_dis**3.5
-        vdd = idx_rad**1.5 * nbr_rad**1.5 / nbr_dis**5.0
-        
-        v2ds = 9.9856 * vds**2.0 * 7.62**2
-        v2dd = 415.565 * vdd**2.0 * 7.62**2
-        
-        assert len(v2ds) <= 86
-        assert len(v2dd) <= 86
-        assert len(nbr_dis) <= 86
-        assert len(nbr_lists) <= 86
-        
-        tabulated_v2ds = np.pad(v2ds, [0, 86-len(v2ds)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_v2dd = np.pad(v2dd, [0, 86-len(v2dd)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_d_ij = np.pad(nbr_dis, [0, 86-len(nbr_dis)],
-                                mode='constant',
-                                constant_values=1E6)
-        
-        tabulated_nbr_idx = np.pad(nbr_lists, [0, 86-len(nbr_lists)],
-                                   mode='constant',
-                                   constant_values=1E6)
-        
-        (shorten_idx_syms,
-         shorten_nbr_syms,
-         shorten_atom_fea,
-         shorten_nbr_fea,
-         shorten_nbr_fea_idx,
-         tabulated_d_ij_sorted,
-         tabulated_nbr_index_sorted,
-         tabulated_v2dd_sorted,
-         tabulated_v2ds_sorted,
-         tabulated_padding_fillter) = self.descriptor.feas(image,
-                                                           enlarged_image,
-                                                           tabulated_nbr_idx,
-                                                           tabulated_d_ij,
-                                                           enlarged_atom_inx,
-                                                           tabulated_v2ds,
-                                                           tabulated_v2dd)
-        
-        shorten_tabulated_site_index = np.mod(enlarged_atom_inx,
-                                              len(image))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        # mulliken 1st nbr shell
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 1**0.5*np.sort(nbr_dis)[1]+0.01))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        idx_mulliken = (self.material_dict[idx_sym][b'IonizationPotential']
-                        + self.material_dict[idx_sym][b'ElectronAffinity']) / 2.0
-        
-        nbr_mulliken = np.array([self.material_dict[nbr_sym][b'IonizationPotential']
-                                 + self.material_dict[nbr_sym][b'ElectronAffinity']
-                                 for nbr_sym in nbr_syms]) / 2.0
-        
-        tabulated_mulliken = (idx_mulliken - np.prod(nbr_mulliken)
-                              **(1/len(nbr_mulliken)))
-        
-        ans = []
-        
-        for idx_model in range(0,10):
-            model = Prediction(shorten_atom_fea,
-                               shorten_nbr_fea,
-                               shorten_nbr_fea_idx,
-                               idx_model=idx_model,
-                               tabulated_filling_inf=tabulated_filling_inf,
-                               tabulated_d_cen_inf=tabulated_d_cen_inf,
-                               tabulated_padding_fillter=tabulated_padding_fillter,
-                               tabulated_full_width_inf=tabulated_full_width_inf,
-                               tabulated_mulliken=tabulated_mulliken,
-                               tabulated_site_index=shorten_tabulated_site_index,
-                               tabulated_v2dd=tabulated_v2dd_sorted,
-                               tabulated_v2ds=tabulated_v2ds_sorted)
-            
-            ans += [model.predict_properties(return_all_parm=return_all_parm)]
-        
-        if return_all_parm == False:
-            ans = np.stack(ans)[:,:,0]
-            mean_center = np.mean(ans[:, 1])   # d-band center
-            std_center = np.std(ans[:, 1])
-            #print(f"band center: {mean_center:.6f} ± {std_center:.6f} eV")
-            return ans[:,1]
-        else:
-            nbr_rad = np.pad(nbr_rad,
-                             [0, 86-len(nbr_rad)],
-                             mode='constant',
-                             constant_values=0)
-            return (ans,
-                    np.concatenate(([idx_rad],
-                                    nbr_rad,
-                                    tabulated_d_ij_sorted,
-                                    [tabulated_d_cen_inf],
-                                    [tabulated_full_width_inf],
-                                    [tabulated_mulliken],
-                                    tabulated_padding_fillter[atom_inx])))
-    
+        """Predict d-band center for a site in an ASE Atoms object."""
+        return self._predict_property(image,
+                                      atom_inx,
+                                      property_name='center',
+                                      return_all_parm=return_all_parm)
+
     def image2band_full_rectangular_width(self,
                                           image,
                                           atom_inx,
                                           return_all_parm=False):
-        
-        assert atom_inx + 1 <= len(image)
-        
-        enlarged_image = image.copy()
-        enlarged_atom_inx = len(enlarged_image)*60 + atom_inx
-        enlarged_image = enlarged_image.repeat((11,11,1))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 5.5))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        tabulated_filling_inf = self.material_dict[idx_sym]['bulk_filling']
-        tabulated_d_cen_inf = self.material_dict[idx_sym]['d_cen']
-        tabulated_full_width_inf = self.material_dict[idx_sym]['full_width']
-        
-        idx_rad = self.material_dict[idx_sym]['rd']
-        nbr_rad = np.array([self.material_dict[nbr_sym]['rd'] for nbr_sym in nbr_syms])
-        
-        vds = idx_rad**1.5 / nbr_dis**3.5
-        vdd = idx_rad**1.5 * nbr_rad**1.5 / nbr_dis**5.0
-        
-        v2ds = 9.9856 * vds**2.0 * 7.62**2
-        v2dd = 415.565 * vdd**2.0 * 7.62**2
-        
-        assert len(v2ds) <= 86
-        assert len(v2dd) <= 86
-        assert len(nbr_dis) <= 86
-        assert len(nbr_lists) <= 86
-        
-        tabulated_v2ds = np.pad(v2ds, [0, 86-len(v2ds)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_v2dd = np.pad(v2dd, [0, 86-len(v2dd)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_d_ij = np.pad(nbr_dis, [0, 86-len(nbr_dis)],
-                                mode='constant',
-                                constant_values=1E6)
-        
-        tabulated_nbr_idx = np.pad(nbr_lists, [0, 86-len(nbr_lists)],
-                                   mode='constant',
-                                   constant_values=1E6)
-        
-        (shorten_idx_syms,
-         shorten_nbr_syms,
-         shorten_atom_fea,
-         shorten_nbr_fea,
-         shorten_nbr_fea_idx,
-         tabulated_d_ij_sorted,
-         tabulated_nbr_index_sorted,
-         tabulated_v2dd_sorted,
-         tabulated_v2ds_sorted,
-         tabulated_padding_fillter) = self.descriptor.feas(image,
-                                                           enlarged_image,
-                                                           tabulated_nbr_idx,
-                                                           tabulated_d_ij,
-                                                           enlarged_atom_inx,
-                                                           tabulated_v2ds,
-                                                           tabulated_v2dd)
-        
-        shorten_tabulated_site_index = np.mod(enlarged_atom_inx,
-                                              len(image))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        # mulliken 1st nbr shell
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 1**0.5*np.sort(nbr_dis)[1]+0.01))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        idx_mulliken = (self.material_dict[idx_sym][b'IonizationPotential']
-                        + self.material_dict[idx_sym][b'ElectronAffinity']) / 2.0
-        
-        nbr_mulliken = np.array([self.material_dict[nbr_sym][b'IonizationPotential']
-                                 + self.material_dict[nbr_sym][b'ElectronAffinity']
-                                 for nbr_sym in nbr_syms]) / 2.0
-        
-        tabulated_mulliken = (idx_mulliken - np.prod(nbr_mulliken)
-                              **(1/len(nbr_mulliken)))
-        
-        ans = []
-        
-        for idx_model in range(0,10):
-            model = Prediction(shorten_atom_fea,
-                               shorten_nbr_fea,
-                               shorten_nbr_fea_idx,
-                               idx_model=idx_model,
-                               tabulated_filling_inf=tabulated_filling_inf,
-                               tabulated_d_cen_inf=tabulated_d_cen_inf,
-                               tabulated_padding_fillter=tabulated_padding_fillter,
-                               tabulated_full_width_inf=tabulated_full_width_inf,
-                               tabulated_mulliken=tabulated_mulliken,
-                               tabulated_site_index=shorten_tabulated_site_index,
-                               tabulated_v2dd=tabulated_v2dd_sorted,
-                               tabulated_v2ds=tabulated_v2ds_sorted)
-            
-            ans += [model.predict_properties(return_all_parm=return_all_parm)]
-        
-        if return_all_parm == False:
-            ans = np.stack(ans)[:,:,0]
-            mean_width = np.mean(ans[:, 2])    # d-band full width
-            std_width = np.std(ans[:, 2])
-            #print(f"band full rectangular width: {mean_width:.6f} ± {std_width:.6f} eV")
-            return ans[:,2]
-        else:
-            nbr_rad = np.pad(nbr_rad,
-                             [0, 86-len(nbr_rad)],
-                             mode='constant',
-                             constant_values=0)
-            return (ans,
-                    np.concatenate(([idx_rad],
-                                    nbr_rad,
-                                    tabulated_d_ij_sorted,
-                                    [tabulated_d_cen_inf],
-                                    [tabulated_full_width_inf],
-                                    [tabulated_mulliken],
-                                    tabulated_padding_fillter[atom_inx])))
-    
+        """Predict the full rectangular d-band width for a site."""
+        return self._predict_property(image,
+                                      atom_inx,
+                                      property_name='width',
+                                      return_all_parm=return_all_parm)
+
     def image2dcen(self,
                    image,
                    atom_inx,
                    return_all_parm=False):
-        
-        image = _copy_without_adsorbates(image)
-        
-        if atom_inx + 1 > len(image):
-            raise IndexError(f"atom_inx={atom_inx} is outside the clean image with {len(image)} atoms.")
-        
-        enlarged_image = image.copy()
-        enlarged_atom_inx = len(enlarged_image)*60 + atom_inx
-        enlarged_image = enlarged_image.repeat((11,11,1))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 5.5))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        tabulated_filling_inf = self.material_dict[idx_sym]['bulk_filling']
-        tabulated_d_cen_inf = self.material_dict[idx_sym]['d_cen']
-        tabulated_full_width_inf = self.material_dict[idx_sym]['full_width']
-        
-        idx_rad = self.material_dict[idx_sym]['rd']
-        nbr_rad = np.array([self.material_dict[nbr_sym]['rd'] for nbr_sym in nbr_syms])
-        
-        vds = idx_rad**1.5 / nbr_dis**3.5
-        vdd = idx_rad**1.5 * nbr_rad**1.5 / nbr_dis**5.0
-        
-        v2ds = 9.9856 * vds**2.0 * 7.62**2
-        v2dd = 415.565 * vdd**2.0 * 7.62**2
-        
-        assert len(v2ds) <= 86
-        assert len(v2dd) <= 86
-        assert len(nbr_dis) <= 86
-        assert len(nbr_lists) <= 86
-        
-        tabulated_v2ds = np.pad(v2ds, [0, 86-len(v2ds)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_v2dd = np.pad(v2dd, [0, 86-len(v2dd)],
-                                mode='constant',
-                                constant_values=0)
-        
-        tabulated_d_ij = np.pad(nbr_dis, [0, 86-len(nbr_dis)],
-                                mode='constant',
-                                constant_values=1E6)
-        
-        tabulated_nbr_idx = np.pad(nbr_lists, [0, 86-len(nbr_lists)],
-                                   mode='constant',
-                                   constant_values=1E6)
-        
+        """Predict d-band center through the analytical TinNet theory module.
+
+        ``return_all_parm=True`` preserves the original SHAP-facing return
+        value: a list of ensemble model outputs and the tabulated physical
+        parameters used as SHAP inputs.
+        """
+        context = self._prepare_site_context(image, atom_inx)
+        predictions = self._run_ensemble(context, method='predict_d_cen',
+                                         return_all_parm=return_all_parm)
+
+        if return_all_parm:
+            return predictions, context['tabulated_parameters']
+
+        predictions = np.stack(predictions)
+        print(f"band center: {np.mean(predictions):.6f} ± {np.std(predictions):.6f}")
+        return predictions
+
+    # ------------------------------------------------------------------
+    # Shared feature preparation and model execution
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pad(values, length, constant=0.0):
+        """Pad a one-dimensional array to a fixed length."""
+        values = np.asarray(values)
+        if len(values) > length:
+            raise ValueError(
+                f"Expected at most {length} neighbors, but found {len(values)}."
+            )
+        return np.pad(values, [0, length - len(values)],
+                      mode='constant', constant_values=constant)
+
+    @staticmethod
+    def _mulliken(material_dict, symbol):
+        """Return Mulliken electronegativity from tabulated atomic properties."""
+        props = material_dict[symbol]
+        return (props[b'IonizationPotential'] + props[b'ElectronAffinity']) / 2.0
+
+    def _prepare_site_context(self, image, atom_inx):
+        """Build all tabulated inputs required by a BandCenter ensemble model.
+
+        The original script duplicated this block in ``predict``,
+        ``image2band_filling``, ``image2band_center``,
+        ``image2band_full_rectangular_width``, and ``image2dcen``.  This method
+        keeps a single source of truth for neighbor selection, tabulated
+        tight-binding features, descriptor construction, and SHAP parameters.
+        """
+        if image is None:
+            raise ValueError("image must be provided.")
+        atom_inx = normalize_atom_index(atom_inx)
+        clean_image = copy_without_adsorbates(image)
+        validate_atom_index(clean_image, atom_inx, label='atom_inx')
+
+        enlarged_image = clean_image.copy()
+        enlarged_atom_inx = len(enlarged_image) * 60 + atom_inx
+        enlarged_image = enlarged_image.repeat((self.REPEAT_TIMES,
+                                                self.REPEAT_TIMES,
+                                                1))
+
+        neighbor_distances = enlarged_image.get_distances(
+            enlarged_atom_inx, list(range(len(enlarged_image)))
+        )
+        neighbor_indices = np.where(
+            (0.01 <= neighbor_distances) &
+            (neighbor_distances <= self.NEIGHBOR_CUTOFF)
+        )[0]
+        order = np.argsort(neighbor_distances[neighbor_indices])
+        neighbor_indices = neighbor_indices[order]
+        neighbor_distances = neighbor_distances[neighbor_indices]
+
+        site_symbol = enlarged_image[enlarged_atom_inx].symbol
+        neighbor_symbols = np.array([enlarged_image[i].symbol for i in neighbor_indices])
+
+        site_props = self.material_dict[site_symbol]
+        tabulated_filling_inf = site_props['bulk_filling']
+        tabulated_d_cen_inf = site_props['d_cen']
+        tabulated_full_width_inf = site_props['full_width']
+
+        site_radius = site_props['rd']
+        neighbor_radii = np.array([self.material_dict[sym]['rd']
+                                   for sym in neighbor_symbols])
+
+        vds = site_radius**1.5 / neighbor_distances**3.5
+        vdd = site_radius**1.5 * neighbor_radii**1.5 / neighbor_distances**5.0
+        tabulated_v2ds = self._pad(9.9856 * vds**2.0 * 7.62**2,
+                                   self.MAX_NEIGHBORS)
+        tabulated_v2dd = self._pad(415.565 * vdd**2.0 * 7.62**2,
+                                   self.MAX_NEIGHBORS)
+        tabulated_d_ij = self._pad(neighbor_distances,
+                                   self.MAX_NEIGHBORS,
+                                   constant=1.0e6)
+        tabulated_neighbor_indices = self._pad(neighbor_indices,
+                                               self.MAX_NEIGHBORS,
+                                               constant=1.0e6)
+
         (shorten_idx_syms,
          shorten_nbr_syms,
          shorten_atom_fea,
@@ -683,328 +268,291 @@ class BandCenter:
          tabulated_nbr_index_sorted,
          tabulated_v2dd_sorted,
          tabulated_v2ds_sorted,
-         tabulated_padding_fillter) = self.descriptor.feas(image,
-                                                           enlarged_image,
-                                                           tabulated_nbr_idx,
-                                                           tabulated_d_ij,
-                                                           enlarged_atom_inx,
-                                                           tabulated_v2ds,
-                                                           tabulated_v2dd)
-        
-        shorten_tabulated_site_index = np.mod(enlarged_atom_inx,
-                                              len(image))
-        
-        nbr_dis = enlarged_image.get_distances(enlarged_atom_inx,
-                                               list(range(len(enlarged_image))))
-        
-        # mulliken 1st nbr shell
-        nbr_lists = np.where((0.01 <= nbr_dis) * (nbr_dis <= 1**0.5*np.sort(nbr_dis)[1]+0.01))[0]
-        
-        nbr_dis = nbr_dis[nbr_lists]
-        nbr_lists = nbr_lists[np.argsort(nbr_dis)]
-        nbr_dis = np.sort(nbr_dis)
-        
-        idx_sym = enlarged_image[enlarged_atom_inx].symbol
-        nbr_syms = np.array([enlarged_image[nbr_list].symbol
-                             for nbr_list in nbr_lists])
-        
-        idx_mulliken = (self.material_dict[idx_sym][b'IonizationPotential']
-                        + self.material_dict[idx_sym][b'ElectronAffinity']) / 2.0
-        
-        nbr_mulliken = np.array([self.material_dict[nbr_sym][b'IonizationPotential']
-                                 + self.material_dict[nbr_sym][b'ElectronAffinity']
-                                 for nbr_sym in nbr_syms]) / 2.0
-        
-        tabulated_mulliken = (idx_mulliken - np.prod(nbr_mulliken)
-                              **(1/len(nbr_mulliken)))
-        
-        ans = []
-        
-        for idx_model in range(0,10):
-            model = Prediction(shorten_atom_fea,
-                               shorten_nbr_fea,
-                               shorten_nbr_fea_idx,
-                               idx_model=idx_model,
-                               tabulated_filling_inf=tabulated_filling_inf,
-                               tabulated_d_cen_inf=tabulated_d_cen_inf,
-                               tabulated_padding_fillter=tabulated_padding_fillter,
-                               tabulated_full_width_inf=tabulated_full_width_inf,
-                               tabulated_mulliken=tabulated_mulliken,
-                               tabulated_site_index=shorten_tabulated_site_index,
-                               tabulated_v2dd=tabulated_v2dd_sorted,
-                               tabulated_v2ds=tabulated_v2ds_sorted)
-            
-            ans += [model.predict_d_cen(return_all_parm=return_all_parm)]
-        
-        if return_all_parm == False:
-            mean = np.mean(ans)
-            std = np.std(ans)
-            print(f"band center: {mean:.6f} ± {std:.6f}")
-            return np.stack(ans)
-        else:
-            nbr_rad = np.pad(nbr_rad,
-                             [0, 86-len(nbr_rad)],
-                             mode='constant',
-                             constant_values=0)
-            return (ans,
-                    np.concatenate(([idx_rad],
-                                    nbr_rad,
-                                    tabulated_d_ij_sorted,
-                                    [tabulated_d_cen_inf],
-                                    [tabulated_full_width_inf],
-                                    [tabulated_mulliken],
-                                    tabulated_padding_fillter[atom_inx])))
-    
+         tabulated_padding_filter) = self.descriptor.feas(
+             clean_image,
+             enlarged_image,
+             tabulated_neighbor_indices,
+             tabulated_d_ij,
+             enlarged_atom_inx,
+             tabulated_v2ds,
+             tabulated_v2dd,
+         )
+
+        # Mulliken electronegativity difference for the first neighbor shell.
+        all_distances = enlarged_image.get_distances(
+            enlarged_atom_inx, list(range(len(enlarged_image)))
+        )
+        first_shell_cutoff = np.sqrt(1.0) * np.sort(all_distances)[1] + 0.01
+        first_shell_indices = np.where(
+            (0.01 <= all_distances) & (all_distances <= first_shell_cutoff)
+        )[0]
+        first_shell_symbols = [enlarged_image[i].symbol for i in first_shell_indices]
+        site_mulliken = self._mulliken(self.material_dict, site_symbol)
+        neighbor_mulliken = np.array([
+            self._mulliken(self.material_dict, sym) for sym in first_shell_symbols
+        ])
+        tabulated_mulliken = site_mulliken - np.prod(neighbor_mulliken)**(1 / len(neighbor_mulliken))
+
+        padded_neighbor_radii = self._pad(neighbor_radii,
+                                          self.MAX_NEIGHBORS,
+                                          constant=0.0)
+        tabulated_parameters = np.concatenate((
+            [site_radius],
+            padded_neighbor_radii,
+            tabulated_d_ij_sorted,
+            [tabulated_d_cen_inf],
+            [tabulated_full_width_inf],
+            [tabulated_mulliken],
+            tabulated_padding_filter[atom_inx],
+        ))
+
+        return {
+            'atom_fea': shorten_atom_fea,
+            'nbr_fea': shorten_nbr_fea,
+            'nbr_fea_idx': shorten_nbr_fea_idx,
+            'tabulated_filling_inf': tabulated_filling_inf,
+            'tabulated_d_cen_inf': tabulated_d_cen_inf,
+            'tabulated_full_width_inf': tabulated_full_width_inf,
+            'tabulated_mulliken': tabulated_mulliken,
+            'tabulated_site_index': np.mod(enlarged_atom_inx, len(clean_image)),
+            'tabulated_v2dd': tabulated_v2dd_sorted,
+            'tabulated_v2ds': tabulated_v2ds_sorted,
+            'tabulated_padding_filter': tabulated_padding_filter,
+            'tabulated_parameters': tabulated_parameters,
+        }
+
+    def _build_model(self, context, idx_model):
+        """Instantiate one pretrained ensemble member from prepared features."""
+        return Prediction(
+            context['atom_fea'],
+            context['nbr_fea'],
+            context['nbr_fea_idx'],
+            idx_model=idx_model,
+            tabulated_filling_inf=context['tabulated_filling_inf'],
+            tabulated_d_cen_inf=context['tabulated_d_cen_inf'],
+            tabulated_padding_fillter=context['tabulated_padding_filter'],
+            tabulated_full_width_inf=context['tabulated_full_width_inf'],
+            tabulated_mulliken=context['tabulated_mulliken'],
+            tabulated_site_index=context['tabulated_site_index'],
+            tabulated_v2dd=context['tabulated_v2dd'],
+            tabulated_v2ds=context['tabulated_v2ds'],
+        )
+
+    def _run_ensemble(self, context, method, return_all_parm=False):
+        """Run all ensemble members with a selected prediction method."""
+        outputs = []
+        for idx_model in range(self.N_ENSEMBLE_MODELS):
+            model = self._build_model(context, idx_model)
+            outputs.append(getattr(model, method)(return_all_parm=return_all_parm))
+        return outputs
+
+    def _predict_property(self, image, atom_inx, property_name, return_all_parm=False):
+        """Shared implementation for filling, center, and width prediction."""
+        if property_name not in self.PROPERTY_INDEX:
+            raise ValueError(f"Unknown property_name: {property_name}")
+
+        context = self._prepare_site_context(image, atom_inx)
+        predictions = self._run_ensemble(context,
+                                         method='predict_properties',
+                                         return_all_parm=return_all_parm)
+        if return_all_parm:
+            return predictions, context['tabulated_parameters']
+
+        predictions = np.stack(predictions)[:, :, 0]
+        return predictions[:, self.PROPERTY_INDEX[property_name]]
+
+    # ------------------------------------------------------------------
+    # SHAP analysis
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _shap_input(tabulated_parameters, model_parameters):
+        """Build the 350-dimensional SHAP input vector for one ensemble member."""
+        return np.atleast_2d(np.hstack((
+            tabulated_parameters,
+            model_parameters[2],   # zeta for 86 neighbor entries
+            model_parameters[3],   # beta and alpha neural state variables
+        )))
+
+    @staticmethod
+    def _aggregate_d_center_shap(shap_values):
+        """Aggregate raw SHAP values into physical effect categories.
+
+        Input feature layout:
+        0       : site d-orbital radius
+        1:87    : neighbor d-orbital radii       -> ligand effect
+        87:173  : sorted interatomic distances   -> strain effect
+        173     : tabulated bulk d-band center
+        174     : tabulated bulk full width
+        175     : Mulliken electronegativity diff -> charge transfer
+        176:262 : padding/filter flags
+        262:348 : zeta relaxation coefficients   -> local relaxation
+        348     : beta charge-transfer variable   -> charge transfer
+        349     : alpha resonance variable        -> resonance
+        """
+        raw = np.asarray(shap_values)
+        return np.array([
+            raw[:, 349].sum(),                 # resonance
+            raw[:, 87:173].sum(),              # strain: distances
+            raw[:, 262:348].sum(),             # relaxation: zeta
+            raw[:, 1:87].sum(),                # ligand: neighbor radii
+            raw[:, 348].sum() + raw[:, 175].sum(),  # charge transfer
+        ])
+
     def gen_shap(self,
                  ref_image,
                  ref_atom_inx,
                  target_image,
                  target_atom_inx):
-        
-        (predicted_parameter_reference,
-         tabulated_parameter_reference) = self.image2dcen(ref_image,
-                                                          ref_atom_inx,
-                                                          return_all_parm=True)
-        
-        (predicted_parameter_target,
-         tabulated_parameter_target) = self.image2dcen(target_image,
-                                                       target_atom_inx,
+        """Return ensemble SHAP decomposition for the d-band center."""
+        predicted_ref, tabulated_ref = self.image2dcen(ref_image,
+                                                       ref_atom_inx,
                                                        return_all_parm=True)
-        
-        shap_ligand = []
-        shap_strain = []
-        shap_relax = []
-        shap_resonance = []
-        shap_elect_transf = []
-        predicted_d_cen_reference = []
-        predicted_d_cen_target = []
-        
-        for i in range(0,10):
-            
-            inp_shap_reference = np.atleast_2d(
-                np.hstack((tabulated_parameter_reference,
-                           predicted_parameter_reference[i][2],
-                           predicted_parameter_reference[i][3])))
-            
-            explainer = shap.Explainer(self.tinnet_d_center,
-                                       inp_shap_reference)
-            
-            inp_shap_target = np.atleast_2d(
-                np.hstack((tabulated_parameter_target,
-                           predicted_parameter_target[i][2],
-                           predicted_parameter_target[i][3])))
-            
-            shap_values = explainer(inp_shap_target).values
-            
-            #shap_idx_rad = shap_values[:,0]
-            shap_nbr_rad = np.sum(shap_values[:,1:87]) # ligand
-            shap_tabulated_d_ij_sorted = np.sum(shap_values[:,87:173]) # strain
-            #shap_tabulated_d_cen_inf = shap_values[:,173]
-            #shap_tabulated_full_width_inf = shap_values[:,174]
-            shap_tabulated_mulliken = shap_values[:,175] # elect. transf
-            #shap_tabulated_padding_fillter = np.sum(shap_values[:,176:262])
-            shap_zeta = np.sum(shap_values[:,262:348]) # relax
-            shap_alpha = shap_values[:,349] # resonance
-            shap_beta = shap_values[:,348] # elect. transf
-            
-            shap_ligand += [shap_nbr_rad]
-            shap_strain += [shap_tabulated_d_ij_sorted]
-            shap_relax += [shap_zeta]
-            shap_resonance += [shap_alpha]
-            shap_elect_transf += [shap_beta + shap_tabulated_mulliken]
-            
-            predicted_d_cen_reference += [predicted_parameter_reference[i][0]]
-            predicted_d_cen_target += [predicted_parameter_target[i][0]]
-        
-        return np.vstack((np.array(predicted_d_cen_reference).flatten(),
-                          np.array(predicted_d_cen_target).flatten(),
-                          np.array(shap_resonance).flatten(),
-                          np.array(shap_strain),
-                          np.array(shap_relax),
-                          np.array(shap_ligand),
-                          np.array(shap_elect_transf).flatten()))
-    
-    def tinnet_d_center(self,
-                        inp_shap):
-        idx_rad = inp_shap[:,0]
-        nbr_rad = inp_shap[:,1:87]
-        tabulated_d_ij_sorted = inp_shap[:,87:173]
-        tabulated_d_cen_inf = inp_shap[:,173]
-        tabulated_full_width_inf = inp_shap[:,174]
-        tabulated_mulliken = inp_shap[:,175]
-        tabulated_padding_fillter = inp_shap[:,176:262]
-        zeta = inp_shap[:,262:348]
-        crys_fea = inp_shap[:,348:350]
-        
-        vds = idx_rad[:,None]**1.5 / tabulated_d_ij_sorted**3.5
-        vdd = idx_rad[:,None]**1.5 * nbr_rad**1.5 / tabulated_d_ij_sorted**5.0
-        
-        v2ds = 9.9856 * vds**2.0 * 7.62**2 * tabulated_padding_fillter
-        v2dd = 415.565 * vdd**2.0 * 7.62**2 * tabulated_padding_fillter
-        
-        m2 = np.sum(v2ds / zeta**(7.0)
-                    + v2dd / zeta**(10.0), axis=1)
-        
-        d_cen_tinnet = (crys_fea[:,1]
-                        * m2**0.5
-                        * (tabulated_d_cen_inf / tabulated_full_width_inf
-                           - crys_fea[:,0] * tabulated_mulliken))
-        
-        return np.atleast_1d(d_cen_tinnet)
-    
+        predicted_target, tabulated_target = self.image2dcen(target_image,
+                                                             target_atom_inx,
+                                                             return_all_parm=True)
+
+        rows = []
+        for ref_params, target_params in zip(predicted_ref, predicted_target):
+            inp_ref = self._shap_input(tabulated_ref, ref_params)
+            inp_target = self._shap_input(tabulated_target, target_params)
+            explainer = shap.Explainer(self.tinnet_d_center, inp_ref)
+            shap_values = explainer(inp_target).values
+            rows.append(np.concatenate((
+                np.atleast_1d(ref_params[0]).ravel()[:1],
+                np.atleast_1d(target_params[0]).ravel()[:1],
+                self._aggregate_d_center_shap(shap_values),
+            )))
+
+        return np.asarray(rows).T
+
+    def tinnet_d_center(self, inp_shap):
+        """Evaluate the analytical d-band-center expression used by SHAP."""
+        inp = np.asarray(inp_shap, dtype=float)
+        site_radius = inp[:, 0]
+        neighbor_radii = inp[:, 1:87]
+        distances = inp[:, 87:173]
+        bulk_center = inp[:, 173]
+        bulk_width = inp[:, 174]
+        mulliken_diff = inp[:, 175]
+        padding_filter = inp[:, 176:262]
+        zeta = inp[:, 262:348]
+        beta = inp[:, 348]
+        alpha = inp[:, 349]
+
+        vds = site_radius[:, None]**1.5 / distances**3.5
+        vdd = site_radius[:, None]**1.5 * neighbor_radii**1.5 / distances**5.0
+        v2ds = 9.9856 * vds**2.0 * 7.62**2 * padding_filter
+        v2dd = 415.565 * vdd**2.0 * 7.62**2 * padding_filter
+
+        second_moment = np.sum(v2ds / zeta**7.0 + v2dd / zeta**10.0, axis=1)
+        d_center = (
+            alpha
+            * np.sqrt(second_moment)
+            * (bulk_center / bulk_width - beta * mulliken_diff)
+        )
+        return np.atleast_1d(d_center)
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
+    _signed_color = staticmethod(signed_color)
+    _format_signed = staticmethod(signed_label)
+
     def explain_shap(self,
                      ref_image=None,
                      ref_atom_inx=None,
                      ref_name='Reference',
                      plot_name='shap',
                      save_fig='png'):
-        
+        """Plot a compact waterfall-style SHAP explanation for d-band center."""
         target_image = self.image
         target_atom_inx = self.atom_inx
         target_name = self.name
-        
-        rcParams['ps.useafm'] = True
-        plt.rc('font',**{'family':'sans-serif','sans-serif':['DejaVu Sans']})
-        rcParams['pdf.fonttype'] = 42
-        rcParams['errorbar.capsize'] = 4.0
-        mpl.rcParams['ytick.major.width'] = 0.5
-        mpl.rcParams['ytick.minor.width'] = 0.5
-        mpl.rcParams['xtick.major.width'] = 0.5
-        mpl.rcParams['xtick.minor.width'] = 0.5
-        matplotlib.rc('xtick.major', size=4)
-        matplotlib.rc('xtick.minor', size=2)
-        matplotlib.rc('ytick.major', size=4)
-        matplotlib.rc('ytick.minor', size=2)
-        matplotlib.rc('lines', linewidth = 0.5)
-        matplotlib.rc('lines', markeredgewidth=0.5)
-        matplotlib.rc('font', size=7)
-        plt.rcParams['axes.linewidth'] = 0.5
-        
+        set_publication_style()
+
+        shap_matrix = self.gen_shap(ref_image,
+                                    ref_atom_inx,
+                                    target_image,
+                                    target_atom_inx)
+        shap_mean = np.average(shap_matrix, axis=1)
+        baseline = shap_mean[0]
+        target_prediction = shap_mean[1]
+        deltas = shap_mean[2:]
+
+        starts = baseline + np.concatenate(([0.0], np.cumsum(deltas[:-1])))
+        y_positions = np.arange(len(deltas), 0, -1)
+
         fig, ax = plt.subplots()
-        fig.set_size_inches(3.375*2.0, 3.375)
-        
-        shap = self.gen_shap(ref_image,
-                             ref_atom_inx,
-                             target_image,
-                             target_atom_inx)
-        
-        shap = np.average(shap, axis=1)
-        
-        dx5 = shap[2]
-        dx4 = shap[3]
-        dx3 = shap[4]
-        dx2 = shap[5]
-        dx1 = shap[6]
-        
-        x5 = shap[0]
-        x4 = x5 + dx5
-        x3 = x4 + dx4
-        x2 = x3 + dx3
-        x1 = x2 + dx2
-        
-        c5 = (shap[2] < 0) * 'red' + (shap[2] >= 0) * 'blue'
-        c4 = (shap[3] < 0) * 'red' + (shap[3] >= 0) * 'blue'
-        c3 = (shap[4] < 0) * 'red' + (shap[4] >= 0) * 'blue'
-        c2 = (shap[5] < 0) * 'red' + (shap[5] >= 0) * 'blue'
-        c1 = (shap[6] < 0) * 'red' + (shap[6] >= 0) * 'blue'
-        
-        ax.arrow(x=x5, y=5, dx=dx5, dy=0, color=c5, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx5),
-                 length_includes_head=True)
-        ax.arrow(x=x4, y=4, dx=dx4, dy=0, color=c4, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx4),
-                 length_includes_head=True)
-        ax.arrow(x=x3, y=3, dx=dx3, dy=0, color=c3, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx3),
-                 length_includes_head=True)
-        ax.arrow(x=x2, y=2, dx=dx2, dy=0, color=c2, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx2),
-                 length_includes_head=True)
-        ax.arrow(x=x1, y=1, dx=dx1, dy=0, color=c1, width=1.0/3.0,
-                 head_width=1.0/3.0, head_length=0.15*np.abs(dx1),
-                 length_includes_head=True)
-        
-        ax.set_ylim([0.5, 5.5])
-        
-        labels = [r'$(\alpha, \xi)$',
-                  r'$d_{ij}$',
-                  r'$\zeta$',
-                  r'$(\lambda, r_{dj})$',
-                  r'$(\beta, \Delta\chi)$']
-        
-        plt.yticks([5,4,3,2,1], labels)
-        
-        ax.annotate('Resonance', xy=(-0.12, 5.0),
-                    xycoords=('axes fraction', 'data'),
-                    ha='center', va='center')
-        ax.annotate('Ligand', xy=(-0.12, 2.0),
-                    xycoords=('axes fraction', 'data'),
-                    ha='center', va='center')
-        ax.annotate('Charge\ntransfer', xy=(-0.12, 1.0),
-                    xycoords=('axes fraction', 'data'),
-                    ha='center', va='center')
-        
-        ax.annotate('Strain',
-                    xy=(-0.06, 3.5), xycoords=('axes fraction', 'data'),
-                    xytext=(-0.12, 3.5), textcoords=('axes fraction', 'data'),
-                    arrowprops=dict(arrowstyle='-[, widthB=3.0, lengthB=1.0'),
-                    ha='center', va='center')
-        
-        sym_5 = (shap[2] < 0) * '-' + (shap[2] >= 0) * '+'
-        sym_4 = (shap[3] < 0) * '-' + (shap[3] >= 0) * '+'
-        sym_3 = (shap[4] < 0) * '-' + (shap[4] >= 0) * '+'
-        sym_2 = (shap[5] < 0) * '-' + (shap[5] >= 0) * '+'
-        sym_1 = (shap[6] < 0) * '-' + (shap[6] >= 0) * '+'
-        
-        ax.annotate(sym_5 + '{:.2f}'.format(round(np.abs(shap[2]), 4)),
-                    xy=(-0.12, 4.70), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c5)
-        ax.annotate(sym_4 + '{:.2f}'.format(round(np.abs(shap[3]), 4)),
-                    xy=(-0.12, 3.80), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c4)
-        ax.annotate(sym_3 + '{:.2f}'.format(round(np.abs(shap[4]), 4)),
-                    xy=(-0.12, 3.20), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c3)
-        ax.annotate(sym_2 + '{:.2f}'.format(round(np.abs(shap[5]), 4)),
-                    xy=(-0.12, 1.70), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c2)
-        ax.annotate(sym_1 + '{:.2f}'.format(round(np.abs(shap[6]), 4)),
-                    xy=(-0.12, 0.60), xycoords=('axes fraction', 'data'),
-                    ha='center', va='center', color=c1)
-        
+        fig.set_size_inches(3.375 * 2.0, 3.375)
+
+        for start, delta, y in zip(starts, deltas, y_positions):
+            color = self._signed_color(delta)
+            ax.arrow(x=start,
+                     y=y,
+                     dx=delta,
+                     dy=0,
+                     color=color,
+                     width=1.0 / 3.0,
+                     head_width=1.0 / 3.0,
+                     head_length=0.15 * abs(delta),
+                     length_includes_head=True)
+            ax.annotate(self._format_signed(delta),
+                        xy=(-0.12, y - 0.30),
+                        xycoords=('axes fraction', 'data'),
+                        ha='center',
+                        va='center',
+                        color=color)
+
+        ax.set_ylim([0.5, len(deltas) + 0.5])
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(self.SHAP_LABELS)
+
+        # Physical-group labels from the original figure, preserved in a compact loop.
+        group_annotations = [
+            ('Resonance', 5.0, None),
+            ('Ligand', 2.0, None),
+            ('Charge\ntransfer', 1.0, None),
+            ('Strain', 3.5, dict(arrowstyle='-[, widthB=3.0, lengthB=1.0')),
+        ]
+        for label, y, arrowprops in group_annotations:
+            if arrowprops is None:
+                ax.annotate(label, xy=(-0.12, y), xycoords=('axes fraction', 'data'),
+                            ha='center', va='center')
+            else:
+                ax.annotate(label,
+                            xy=(-0.06, y), xycoords=('axes fraction', 'data'),
+                            xytext=(-0.12, y), textcoords=('axes fraction', 'data'),
+                            arrowprops=arrowprops,
+                            ha='center', va='center')
+
         ax.set_xlabel(r'$d\rm{-band\ center}$ (eV)')
         ax.spines[['left', 'right', 'top']].set_visible(False)
-        
         ax.tick_params('y', length=0, width=0, which='major')
-        
-        ax.plot([x5, x5],[7, 0.5],'--', color='gray', linewidth=1)
-        
-        ax.plot([x4, x4], [5 + 1.0 / 3.0, 4 - 1.0 / 3.0],'--', color='gray',
-                linewidth=1)
-        ax.plot([x3, x3], [4 + 1.0 / 3.0, 3 - 1.0 / 3.0],'--', color='gray',
-                linewidth=1)
-        ax.plot([x2, x2], [3 + 1.0 / 3.0, 2 - 1.0 / 3.0],'--', color='gray',
-                linewidth=1)
-        ax.plot([x1, x1], [2 + 1.0 / 3.0, 1 - 1.0 / 3.0],'--', color='gray',
-                linewidth=1)
-        
-        ax.plot([x1 + dx1, x1 + dx1],[7, 0.5],'--', color='orange',
-                linewidth=1)
-        
-        ax.annotate(ref_name + '\n{:.2f}'.format(round(x5, 4)),
-                    xy=(x5, 1.15), xycoords=('data', 'axes fraction'),
-                    ha='center', va='center', color='gray')
-        ax.annotate(target_name + '\n{:.2f}'.format(round(x1 + dx1, 4)),
-                    xy=(x1 + dx1, 1.05), xycoords=('data', 'axes fraction'),
-                    ha='center', va='center', color='orange')
-        
-        fig.tight_layout()
-        
-        if save_fig == 'png':
-            fig.savefig(plot_name + '.png', bbox_inches='tight', dpi=600)
-        elif save_fig == 'pdf':
-            fig.savefig(plot_name + '.pdf', bbox_inches='tight')
 
+        # Dashed connector lines between consecutive waterfall steps.
+        ax.plot([baseline, baseline], [len(deltas) + 2, 0.5], '--', color='gray', linewidth=1)
+        for x, y in zip(starts[1:], y_positions[:-1]):
+            ax.plot([x, x], [y + 1.0 / 3.0, y - 1 - 1.0 / 3.0],
+                    '--', color='gray', linewidth=1)
+        ax.plot([target_prediction, target_prediction],
+                [len(deltas) + 2, 0.5], '--', color='orange', linewidth=1)
+
+        ax.annotate(ref_name + f'\n{baseline:.2f}',
+                    xy=(baseline, 1.15),
+                    xycoords=('data', 'axes fraction'),
+                    ha='center',
+                    va='center',
+                    color='gray')
+        ax.annotate(target_name + f'\n{target_prediction:.2f}',
+                    xy=(target_prediction, 1.05),
+                    xycoords=('data', 'axes fraction'),
+                    ha='center',
+                    va='center',
+                    color='orange')
+
+        fig.tight_layout()
+        save_figure(fig, plot_name, save_fig)
+        return fig, ax
 
 class Prediction:
     def __init__(self,
@@ -1031,8 +579,9 @@ class Prediction:
         # Initialize Physical Model
         Moment.__init__(self, phys_model, **kwargs)
         
-        cuda = torch.cuda.is_available()
-        
+        device = torch_device()
+        cuda = device.type == 'cuda'
+
         # build model
         orig_atom_fea_len = atom_fea.shape[-1]
         nbr_fea_len = nbr_fea.shape[-1]
@@ -1042,29 +591,19 @@ class Prediction:
                                     n_conv=n_conv,
                                     h_fea_len=h_fea_len,
                                     n_h=n_h,
-                                    model_num_input=self.model_num_input)
-        
-        if cuda:
-            model.cuda()
-        
+                                    model_num_input=self.model_num_input).to(device)
+
+        def tensor_on_device(value, dtype=torch.float32):
+            return torch.as_tensor(np.asarray(value), dtype=dtype, device=device)
+
         # Initialize the class
-        if cuda:
-            tabulated_filling_inf = torch.from_numpy(np.array(tabulated_filling_inf)).cuda()
-            tabulated_d_cen_inf = torch.from_numpy(np.array(tabulated_d_cen_inf)).cuda()
-            tabulated_full_width_inf = torch.from_numpy(np.array(tabulated_full_width_inf)).cuda()
-            tabulated_mulliken = torch.from_numpy(np.array(tabulated_mulliken)).cuda()
-            tabulated_site_index = torch.from_numpy(np.array(tabulated_site_index)).cuda()
-            tabulated_v2dd = torch.from_numpy(np.array(tabulated_v2dd)).cuda()
-            tabulated_v2ds = torch.from_numpy(np.array(tabulated_v2ds)).cuda()
-        
-        else:
-            tabulated_filling_inf = torch.from_numpy(np.array(tabulated_filling_inf))
-            tabulated_d_cen_inf = torch.from_numpy(np.array(tabulated_d_cen_inf))
-            tabulated_full_width_inf = torch.from_numpy(np.array(tabulated_full_width_inf))
-            tabulated_mulliken = torch.from_numpy(np.array(tabulated_mulliken))
-            tabulated_site_index = torch.from_numpy(np.array(tabulated_site_index))
-            tabulated_v2dd = torch.from_numpy(np.array(tabulated_v2dd))
-            tabulated_v2ds = torch.from_numpy(np.array(tabulated_v2ds))
+        tabulated_filling_inf = tensor_on_device(tabulated_filling_inf)
+        tabulated_d_cen_inf = tensor_on_device(tabulated_d_cen_inf)
+        tabulated_full_width_inf = tensor_on_device(tabulated_full_width_inf)
+        tabulated_mulliken = tensor_on_device(tabulated_mulliken)
+        tabulated_site_index = tensor_on_device(tabulated_site_index, dtype=torch.long)
+        tabulated_v2dd = tensor_on_device(tabulated_v2dd)
+        tabulated_v2ds = tensor_on_device(tabulated_v2ds)
         
         self.tabulated_filling_inf = tabulated_filling_inf
         self.tabulated_d_cen_inf = tabulated_d_cen_inf
@@ -1079,105 +618,62 @@ class Prediction:
         self.model = model
         self.idx_model = idx_model
         
-        self.atom_fea = torch.from_numpy(atom_fea.astype(np.float32))
-        self.nbr_fea = torch.from_numpy(nbr_fea.astype(np.float32))
-        self.nbr_fea_idx = torch.from_numpy(nbr_fea_idx)
-        self.tabulated_padding_fillter = torch.from_numpy(tabulated_padding_fillter)
-        self.crystal_atom_idx = torch.from_numpy(np.arange(atom_fea.shape[0]))
+        self.device = device
+        self.atom_fea = torch.as_tensor(atom_fea.astype(np.float32), device=device)
+        self.nbr_fea = torch.as_tensor(nbr_fea.astype(np.float32), device=device)
+        self.nbr_fea_idx = torch.as_tensor(nbr_fea_idx, dtype=torch.long, device=device)
+        self.tabulated_padding_fillter = torch.as_tensor(tabulated_padding_fillter, device=device)
+        self.crystal_atom_idx = torch.as_tensor(np.arange(atom_fea.shape[0]), dtype=torch.long, device=device)
     
-    def predict_d_cen(self,
-                      return_all_parm=False,
-                      **kwargs):
-        
-        if self.cuda:
-            best_checkpoint = torch.load('./data/pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar')
-        else:
-            best_checkpoint = torch.load('./data/pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar', map_location=torch.device('cpu'))
-        
-        self.model.load_state_dict(best_checkpoint['state_dict'])
-        
-        # switch to evaluate mode
+    def _input_var(self):
+        """Return tensors in the order expected by the GCNN forward pass."""
+        return (
+            self.atom_fea,
+            self.nbr_fea,
+            self.nbr_fea_idx,
+            self.tabulated_padding_fillter,
+            self.crystal_atom_idx,
+            self.tabulated_site_index,
+        )
+
+    def _predict_moment_outputs(self):
+        """Run one pretrained band-center ensemble member and return raw outputs."""
+        load_checkpoint_state(
+            self.model,
+            pretrained_path('band_center', f'model_{self.idx_model}.pth.tar'),
+            torch_device(),
+        )
         self.model.eval()
-        
+
         with torch.no_grad():
-            if self.cuda:
-                input_var = (Variable(self.atom_fea.cuda(non_blocking=True)),
-                             Variable(self.nbr_fea.cuda(non_blocking=True)),
-                             self.nbr_fea_idx.cuda(non_blocking=True),
-                             self.tabulated_padding_fillter.cuda(non_blocking=True),
-                             self.crystal_atom_idx.cuda(non_blocking=True),
-                             self.tabulated_site_index.cuda(non_blocking=True))
-            else:
-                input_var = (Variable(self.atom_fea),
-                             Variable(self.nbr_fea),
-                             self.nbr_fea_idx,
-                             self.tabulated_padding_fillter,
-                             self.crystal_atom_idx,
-                             self.tabulated_site_index)
-        
-        # compute output
-        cnn_output, cnn_output_crys = self.model(*input_var)
-        
-        if self.phys_model =='moment':
-            output, parm, zeta, crys_fea = Moment.moment(
-                self,
-                cnn_output,
-                cnn_output_crys)
-        
-        if return_all_parm == True:
-            return (output.detach().cpu().numpy(),
-                    parm.detach().cpu().numpy(),
-                    zeta.detach().cpu().numpy()**(1.0/7.0),
-                    crys_fea.detach().cpu().numpy())
-        else:
-            return output.detach().cpu().numpy()
-    
-    def predict_properties(self,
-                           return_all_parm=False,
-                           **kwargs):
-        
-        if self.cuda:
-            best_checkpoint = torch.load('./data/pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar')
-        else:
-            best_checkpoint = torch.load('./data/pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar', map_location=torch.device('cpu'))
-        
-        self.model.load_state_dict(best_checkpoint['state_dict'])
-        
-        # switch to evaluate mode
-        self.model.eval()
-        
-        with torch.no_grad():
-            if self.cuda:
-                input_var = (Variable(self.atom_fea.cuda(non_blocking=True)),
-                             Variable(self.nbr_fea.cuda(non_blocking=True)),
-                             self.nbr_fea_idx.cuda(non_blocking=True),
-                             self.tabulated_padding_fillter.cuda(non_blocking=True),
-                             self.crystal_atom_idx.cuda(non_blocking=True),
-                             self.tabulated_site_index.cuda(non_blocking=True))
-            else:
-                input_var = (Variable(self.atom_fea),
-                             Variable(self.nbr_fea),
-                             self.nbr_fea_idx,
-                             self.tabulated_padding_fillter,
-                             self.crystal_atom_idx,
-                             self.tabulated_site_index)
-        
-        # compute output
-        cnn_output, cnn_output_crys = self.model(*input_var)
-        
-        if self.phys_model =='moment':
-            output, parm, zeta, crys_fea = Moment.moment(
-                self,
-                cnn_output,
-                cnn_output_crys)
-        
-        if return_all_parm == True:
-            return (output.detach().cpu().numpy(),
-                    parm.detach().cpu().numpy(),
-                    zeta.detach().cpu().numpy()**(1.0/7.0),
-                    crys_fea.detach().cpu().numpy())
-        else:
-            return parm.detach().cpu().numpy()
+            cnn_output, cnn_output_crys = self.model(*self._input_var())
+            if self.phys_model != 'moment':
+                raise ValueError(f"Unsupported physical model: {self.phys_model}")
+            return Moment.moment(self, cnn_output, cnn_output_crys)
+
+    @staticmethod
+    def _numpy_bundle(output, parm, zeta, crys_fea):
+        """Convert the raw theory-module tensors to NumPy arrays."""
+        return (
+            output.detach().cpu().numpy(),
+            parm.detach().cpu().numpy(),
+            zeta.detach().cpu().numpy() ** (1.0 / 7.0),
+            crys_fea.detach().cpu().numpy(),
+        )
+
+    def predict_d_cen(self, return_all_parm=False, **kwargs):
+        """Predict the d-band center from the analytical TinNet theory module."""
+        output, parm, zeta, crys_fea = self._predict_moment_outputs()
+        if return_all_parm:
+            return self._numpy_bundle(output, parm, zeta, crys_fea)
+        return output.detach().cpu().numpy()
+
+    def predict_properties(self, return_all_parm=False, **kwargs):
+        """Predict filling, center, and full rectangular width."""
+        output, parm, zeta, crys_fea = self._predict_moment_outputs()
+        if return_all_parm:
+            return self._numpy_bundle(output, parm, zeta, crys_fea)
+        return parm.detach().cpu().numpy()
 
 
 class ConvLayer(nn.Module):
@@ -1217,9 +713,9 @@ class ConvLayer(nn.Module):
         Parameters
         ----------
 
-        atom_in_fea: Variable(torch.Tensor) shape (N, atom_fea_len)
+        atom_in_fea: (torch.Tensor) shape (N, atom_fea_len)
           Atom hidden features before convolution
-        nbr_fea: Variable(torch.Tensor) shape (N, M, nbr_fea_len)
+        nbr_fea: (torch.Tensor) shape (N, M, nbr_fea_len)
           Bond features of each atom's M neighbors
         nbr_fea_idx: torch.LongTensor shape (N, M)
           Indices of M neighbors of each atom
@@ -1227,7 +723,7 @@ class ConvLayer(nn.Module):
         Returns
         -------
 
-        atom_out_fea: nn.Variable shape (N, atom_fea_len)
+        atom_out_fea: torch.Tensor shape (N, atom_fea_len)
           Atom hidden features after convolution
 
         '''
@@ -1315,9 +811,9 @@ class CrystalGraphConvNet(nn.Module):
         Parameters
         ----------
 
-        atom_fea: Variable(torch.Tensor) shape (N, orig_atom_fea_len)
+        atom_fea: (torch.Tensor) shape (N, orig_atom_fea_len)
           Atom features from atom type
-        nbr_fea: Variable(torch.Tensor) shape (N, M, nbr_fea_len)
+        nbr_fea: (torch.Tensor) shape (N, M, nbr_fea_len)
           Bond features of each atom's M neighbors
         nbr_fea_idx: torch.LongTensor shape (N, M)
           Indices of M neighbors of each atom
@@ -1327,7 +823,7 @@ class CrystalGraphConvNet(nn.Module):
         Returns
         -------
 
-        prediction: nn.Variable shape (N, )
+        prediction: torch.Tensor shape (N, )
           Atom hidden features after convolution
 
         '''
@@ -1444,7 +940,7 @@ class Features:
         
         # Load superstructure of atom features
         if dict_atom_fea is None:
-            self.dict_atom_fea = self.dict_atom_fea_default()
+            self.dict_atom_fea = atom_features()
         else:
             self.dict_atom_fea = dict_atom_fea
         
@@ -1574,559 +1070,4 @@ class Features:
                 tabulated_v2dd[tmp],
                 tabulated_v2ds[tmp],
                 padding_fillter)
-    
-    def dict_atom_fea_default(self):
-        
-        # Default superstructure of atom features
-        atom_fea_dict = {
-            1: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            2: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 1, 0, 0, 0],
-            3: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0],
-            4: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            5: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            6: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0],
-            7: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            8: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            9: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0,
-                0, 0, 1, 0, 0, 0, 0, 0],
-            10: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            11: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            12: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            13: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            14: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            15: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            16: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            17: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            18: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            19: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            20: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            21: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            22: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            23: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            24: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            25: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            26: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            27: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            28: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            29: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            30: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            31: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            32: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            33: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            34: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            35: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            36: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            37: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            38: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            39: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            40: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            41: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            42: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            43: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            44: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            45: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            46: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            47: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            48: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            49: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            50: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            51: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            52: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            53: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            54: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            55: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            56: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            57: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            58: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            59: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            60: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            61: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            62: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            63: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            64: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            65: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            66: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            67: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            68: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            69: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            70: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            71: [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            72: [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            73: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            74: [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            75: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            76: [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            77: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            78: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            79: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-            80: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            81: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            82: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            83: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            84: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            85: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            86: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            87: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            88: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-            89: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            90: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            91: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-            92: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            93: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            94: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            95: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            96: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            97: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            98: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            99: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            100: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                  0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}
-        return atom_fea_dict
-    
-    def material_dict():
-        # Element name
-        # d-band center, eV
-        # d-band full width, eV
-        # rd, A
-        # bulk_filling, -
-        
-        reference_data = {'Ag':{'d_cen':-4.1421, 'full_width': 4.5040, 'rd': 0.6606606606606606, 'bulk_filling': 9.755790629075912213e-01},
-                          'Au':{'d_cen':-3.6577, 'full_width': 5.8312, 'rd': 0.7607607607607607, 'bulk_filling': 9.638752405788268973e-01},
-                          #'Cd':{'d_cen':-8.6701, 'full_width': 3.4283, 'bulk_filling': 9.931763504350845650e-01},
-                          'Co':{'d_cen':-1.5905, 'full_width': 6.6969, 'rd': 0.5605605605605606, 'bulk_filling': 7.711781551994808526e-01},
-                          'Cr':{'d_cen':-0.0876, 'full_width': 7.2096, 'rd': 0.6306306306306306, 'bulk_filling': 5.026890307897071697e-01},
-                          'Cu':{'d_cen':-2.6521, 'full_width': 4.2446, 'rd': 0.4904904904904905, 'bulk_filling': 9.687762969001947333e-01},
-                          'Fe':{'d_cen':-0.9278, 'full_width': 7.1120, 'rd': 0.6206206206206206, 'bulk_filling': 6.842646244058228078e-01},
-                          #'Hf':{'d_cen': 2.0669, 'full_width':10.4322, 'bulk_filling': 2.798683666831001671e-01},
-                          'Ir':{'d_cen':-2.6636, 'full_width': 9.5022, 'rd': 0.8208208208208209, 'bulk_filling': 7.713775689575533834e-01},
-                          #'La':{'d_cen': 2.0866, 'full_width': 8.0907, 'bulk_filling': 2.196169569958589252e-01},
-                          'Mn':{'d_cen':-0.6036, 'full_width': 7.0846, 'rd': 0.5905905905905906, 'bulk_filling': 5.625623395638867930e-01},
-                          'Mo':{'d_cen':-0.0110, 'full_width': 9.0573, 'rd': 0.8608608608608609, 'bulk_filling': 5.085650613858612168e-01},
-                          'Nb':{'d_cen': 0.6878, 'full_width': 8.9762, 'rd': 0.9409409409409409, 'bulk_filling': 4.053595224934098407e-01},
-                          'Ni':{'d_cen':-1.6686, 'full_width': 5.3541, 'rd': 0.5205205205205206, 'bulk_filling': 8.642030365513106993e-01},
-                          'Os':{'d_cen':-1.9693, 'full_width':10.6399, 'rd': 0.8508508508508509, 'bulk_filling': 6.868617591064947181e-01},
-                          'Pd':{'d_cen':-2.0870, 'full_width': 5.6793, 'rd': 0.6706706706706707, 'bulk_filling': 9.147420170513048676e-01},
-                          'Pt':{'d_cen':-2.6369, 'full_width': 7.6381, 'rd': 0.7907907907907907, 'bulk_filling': 8.750916806647935919e-01},
-                          'Re':{'d_cen':-1.0633, 'full_width':10.9953, 'rd': 0.8808808808808809, 'bulk_filling': 5.905781396979362663e-01},
-                          'Rh':{'d_cen':-2.0874, 'full_width': 7.3926, 'rd': 0.7207207207207207, 'bulk_filling': 7.951773878664225581e-01},
-                          'Ru':{'d_cen':-1.6305, 'full_width': 8.0663, 'rd': 0.7507507507507507, 'bulk_filling': 7.060335740069819677e-01},
-                          'Sc':{'d_cen': 1.7032, 'full_width': 5.9997, 'rd': 0.9409409409409409, 'bulk_filling': 1.936272929841076074e-01},
-                          'Ta':{'d_cen': 1.1906, 'full_width':10.8913, 'rd': 1.021021021021021 , 'bulk_filling': 3.786712857939578680e-01},
-                          'Ti':{'d_cen': 1.3243, 'full_width': 6.7421, 'rd': 0.7907907907907907, 'bulk_filling': 2.653109539307398901e-01},
-                          'V': {'d_cen': 0.5548, 'full_width': 6.9774, 'rd': 0.6906906906906907, 'bulk_filling': 3.818390980189110273e-01},
-                          'W': {'d_cen': 0.1732, 'full_width':10.7373, 'rd': 0.9409409409409409, 'bulk_filling': 4.850581815594974255e-01},
-                          'Y': {'d_cen': 2.2707, 'full_width': 7.8737, 'rd': 1.2512512512512513, 'bulk_filling': 1.875853315789731690e-01},
-                          #'Zn':{'d_cen':-7.3926, 'full_width': 2.4747, 'bulk_filling': 9.979212627042637340e-01},
-                          'Zr':{'d_cen': 1.6485, 'full_width': 8.9050, 'rd': 1.0710710710710711, 'bulk_filling': 2.920224652312821134e-01}}
-        
-        with open('./data/MaterialDict.pkl', 'rb') as f:
-            data = pickle.load(f, encoding='bytes')
-        data = {k.decode('utf8'): v for k, v in data.items()}
-        
-        keys = reference_data.keys()
-        
-        properties = ['d_cen', 'full_width', 'rd', 'bulk_filling']
-        
-        for key in keys:
-            for prop in properties:
-                data[key][prop] = reference_data[key][prop]
-        
-        return data
+
