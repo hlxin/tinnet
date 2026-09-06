@@ -1,91 +1,119 @@
-# Tinnet
+# TinNet
 
-Tinnet is a foundation AI package for integrated catalysis. The first released module is `tinnet` for property prediction with pretrained models for adsorption energy, cohesive energy, band center, and band moments. SHAP explainability is provided.
+TinNet (Theory-infused Neural Network) is a foundation AI package for integrated catalysis.
+The `tinnet` module provides pretrained, interpretable models for adsorption energy,
+cohesive energy, d-band center, and d-band moments, with SHAP explanations expressed in
+terms of physical parameters.
 
 ## Usage
 
 ```python
 from tinnet import tinnet
 
-model = tinnet.AdsorptionEnergy()
-y = model.predict(atoms)
-shap_vals = model.explain_shap(atoms)
+model = tinnet.AdsorptionEnergy(image=slab, site_inx=[20], adsorbate='OH', name='Pt_MLPt3Co111')
+y = model.predict()                                # ensemble adsorption energies (eV)
+terms = model.decompose()                          # per-orbital hybridization / orthogonalization terms
+fig, ax = model.explain_shap(ref_image=pure_pt, ref_site_inx=[5], ref_name='Pure Pt')
+```
 
-Updates
-# May 05, 2026
+See `examples/run_tinnet_example.py` and `tutorials/tinnet.ipynb` for the full workflow
+(adsorption energy, band center, band moments, cohesive energy).
 
-# TinNet refactor notes
+## Architecture: one contract for every property
 
-# TinNet refactor v2
+Every TinNet model is a graph neural network followed by a **physics head**:
 
-This version keeps the notebook-facing public APIs and pretrained checkpoint paths intact while reducing duplicated boilerplate across the four model scripts.
+```
+crystal graph --GNN--> latent outputs --PhysicsModel.parameters()--> physical parameters
+                                       --PhysicsModel.property_from_parameters()--> property
+```
 
-## Main engineering changes
+The physics heads live in `tinnet/tinnet/physics/` and share the
+`PhysicsModel` contract (`physics/base.py`):
 
-- Added shared helpers in `tinnet_utils.py` for:
-  - one-pass inference `DataLoader` creation
-  - sparse/dense tensor stacking by ids
-  - device-safe tensor/list movement
-  - signed SHAP labels/colors
-  - generic horizontal waterfall plotting
-  - figure saving
-- `adsorption_energy.py`
-  - merged duplicate OH/O checkpoint evaluation paths in `Regression.eval_model()`
-  - removed the empty `Features.dict_atom_prop_default()` wrapper
-  - reused shared figure-saving and sign-format helpers
-- `band_center.py`
-  - removed the empty `Features.material_dict()` wrapper
-  - `BandCenter.__init__()` now directly calls `material_properties()`
-  - merged duplicated `Prediction.predict_d_cen()` and `Prediction.predict_properties()` internals through `_predict_moment_outputs()`
-  - reused shared figure-saving and sign-format helpers
-- `band_moments.py`
-  - moved ensemble defaults to class-level constants
-  - removed unused intermediate/debug accumulators from `predict()`
-  - extracted ensemble execution and moment-summary printing into helper methods
-  - kept the tight-binding hopping construction numerically unchanged
-- `cohesive_energy.py`
-  - retained the v1 cleanup and removed unused legacy imports
+| registry name      | class                  | property                       | latent per row | constants                          |
+|--------------------|------------------------|--------------------------------|----------------|------------------------------------|
+| `newns_anderson`   | `NewnsAndersonModel`   | adsorption energy              | 3/orbital (+2) | `vad2` (+ `d_cen`, `width`)        |
+| `rectangular_band` | `RectangularBandModel` | d-band filling / center / width| M + 3          | hopping couplings, bulk references |
+| `moments`          | `MomentModel`          | d-band moments μ2, μ3, μ4      | 3 per pair     | tight-binding hopping masks        |
+| `cohesion`         | `CohesionModel`        | cohesive energy per atom       | 6              | promotion energy, Wigner-Seitz volume |
 
-## Validation performed here
+Because `property_from_parameters` is the *only* implementation of each theory equation,
+one object serves checkpoint inference, SHAP (`physics.shap_function`), and training
+(gradients flow through the theory into the GNN). `physics.describe()` prints the contract.
 
-- Python syntax check: `python -m py_compile *.py`
+Supporting modules:
 
-Full numerical validation still needs to be run in the actual TinNet environment with `data/pretrained/` and the notebook examples.
+- `gnn.py` – shared CGCNN with `mean`, `site`, or `atom` readout (checkpoint-compatible).
+- `descriptors.py` – Voronoi crystal-graph descriptor.
+- `training.py` – `TheoryInfusedModel(gnn, physics)`, `fit`, `evaluate`, `save_checkpoint`.
 
-# TinNet refactor v1
+## Extending to new adsorbates
 
-This folder contains a refactored version of the current TinNet model scripts.
-The refactor preserves the trained model architectures, checkpoint filenames,
-and physics equations, while cleaning the engineering layer around them.
+For a shared model that consumes complete adsorbate/surface geometries and
+predicts conservative forces, see the new [shared adsorption S2EF guide](docs/shared_adsorption.md).
+It includes OC20 LMDB ingestion, energy/force training, and ASE relaxation.
+This is an initial trainable architecture; its tutorial checkpoints are not
+validated predictors for the full OC20 chemistry space.
 
-## Files
+The Newns-Anderson head is adsorbate-agnostic. An adsorbate is *data*: which frontier
+orbitals couple to the d band, their degeneracy, the orthogonalization coefficient, the sp
+offset, the geometry above the site, and which pretrained ensemble to load.
 
-- `tinnet_utils.py`: shared utilities for device handling, checkpoint paths,
-  non-mutating ASE structure copying, element-constant lookup, and Matplotlib
-  publication style.
-- `adsorption_energy.py`: OH/O atop adsorption-energy TinNet model.
-- `band_center.py`: d-band filling, center, and rectangular-width TinNet model.
-- `band_moments.py`: second-, third-, and fourth-order d-band moment TinNet model.
-- `cohesive_energy.py`: cohesive-energy TinNet model.
-- `tinnet.ipynb`: original notebook kept as a reference driver.
+```python
+from tinnet.tinnet.physics import AdsorbateSpec, OrbitalSpec, register_adsorbate
 
-## Design principles
+register_adsorbate(AdsorbateSpec(
+    name='N',
+    orbitals=(OrbitalSpec('pz',  r'p_{z}',  degeneracy=1, alpha=0.07),
+              OrbitalSpec('pxy', r'p_{xy}', degeneracy=2, alpha=0.05)),
+    esp=-4.0,
+    geometry=(('N', (0.0, 0.0, 1.55)),),
+    d_band='latent',            # GNN predicts d_cen/width (as for OH); 'tabulated' uses BandCenter (as for O)
+    gnn=dict(atom_fea_len=64, n_conv=3, h_fea_len=64, n_h=2),
+    checkpoint=('adsorption_energy', 'N', 'atop'),
+))
 
-1. Keep the public API used by the notebook unchanged.
-2. Do not alter neural-network architectures or physics equations.
-3. Avoid mutating the caller's ASE `Atoms` object.
-4. Centralize recurring infrastructure code in `tinnet_utils.py`.
-5. Use explicit checkpoint-path resolution instead of raw `./data/...` strings.
-6. Remove deprecated PyTorch `Variable` usage.
-7. Use safer tensor constructors and detach returned analysis parameters when
-   they should not keep an autograd graph.
+model = tinnet.AdsorptionEnergy(image=slab, site_inx=[site], adsorbate='N')
+```
 
-## Validation performed here
+OH and O are two such entries (`physics/adsorbates.py`); no theory code changed.
+`examples/add_new_adsorbate.py` is a complete template that registers an adsorbate,
+trains an ensemble through the theory head with `training.fit`, saves checkpoints where
+`AdsorptionEnergy` expects them, and predicts with the facade.
 
-- Python syntax compilation for all `.py` files.
+## Extending to new properties
 
-## Validation still recommended in your repository
+1. Subclass `PhysicsModel`, declare `n_latent`, `constant_names`, `parameter_names`
+   (+ labels), and implement `parameters(latent, constants)` and
+   `property_from_parameters(params)` as batched, differentiable torch code.
+2. Decorate it with `@register_physics('my_property')`.
+3. Choose a GNN readout (`mean` per structure, `site` per site, `atom` per atom), build
+   `TheoryInfusedModel(gnn, physics)`, and train with `training.fit`. Auxiliary targets on
+   any physical parameter (for example a DFT d-band center) are added with
+   `parameter_weights={'d_cen': 0.1}`.
+4. SHAP comes for free: `shap.Explainer(physics.shap_function, reference_parameters)`.
 
-Run the notebook from your TinNet repository root, where the `data/` directory
-and pretrained checkpoints are available. Compare the ensemble means and standard
-deviations against your current working version for the example systems.
+## Tests
+
+```
+pytest                    # fast unit tests of the physics package (no checkpoints needed)
+pytest -m integration     # notebook examples against data/pretrained (a few minutes)
+```
+
+## Refactor notes (September 2026)
+
+- Added the `physics/` package, `gnn.py`, `descriptors.py`, and `training.py`.
+- `adsorption_energy.py` no longer contains OH/O branches: `AdsorptionEnergy` reads an
+  `AdsorbateSpec`, and the Newns-Anderson equation exists once (previously a scalar copy for
+  inference and a batched copy for SHAP).
+- `cohesive_energy.py`, `band_center.py`, and `band_moments.py` delegate their theory
+  to `CohesionModel`, `RectangularBandModel`, and `MomentModel`; the duplicated `ConvLayer`
+  now comes from `gnn.py`. Cohesive-energy inference no longer spawns a `multiprocessing.Pool`
+  (which re-imported the calling script on macOS).
+- Validation: all notebook quantities were recomputed with the original code and the
+  refactored code. Band center, band moments, and cohesive energies are bit-identical;
+  adsorption energies agree to 4e-6 eV; SHAP values agree to 1e-4 eV (the band-center SHAP
+  uses a stochastic permutation explainer and varies run to run by the same amount).
+- Removed: the in-module `Regression`/`Chemisorption`/`TightBinding` classes (replaced by
+  `AdsorptionEnsemble`/`CohesionEnsemble` plus the physics heads). Public notebook APIs are unchanged.

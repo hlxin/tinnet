@@ -18,40 +18,28 @@ from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler
 
 try:
+    from .gnn import ConvLayer
+    from .physics import MomentModel
     from .tinnet_utils import (
         atom_features,
-        as_float_tensor,
         material_properties,
-        as_long_tensor,
         copy_without_adsorbates,
-        data_path,
         load_checkpoint_state,
-        normalize_atom_index,
-        normalize_site_indices,
         pretrained_path,
-        set_publication_style,
-        stack_scalar_parameters,
         torch_device,
         validate_atom_index,
-        values_for_symbols,
     )
 except ImportError:  # Allows running this file directly during debugging.
+    from gnn import ConvLayer
+    from physics import MomentModel
     from tinnet_utils import (
         atom_features,
-        as_float_tensor,
         material_properties,
-        as_long_tensor,
         copy_without_adsorbates,
-        data_path,
         load_checkpoint_state,
-        normalize_atom_index,
-        normalize_site_indices,
         pretrained_path,
-        set_publication_style,
-        stack_scalar_parameters,
         torch_device,
         validate_atom_index,
-        values_for_symbols,
     )
 
 
@@ -341,14 +329,6 @@ class BandMoments:
             nbr_fea_idx += [torch.tensor(np.array(nbr_fea_idx_tmp)).to_sparse_coo()] # index of neighboring atoms
             nbr_fea += [torch.tensor(np.array(nbr_fea_tmp)).to_sparse_coo()] # bond features
             padding_filter += [torch.tensor(np.array(padding_filter_tmp)).to_sparse_coo()] # neighoring atoms within 1 rc (3.6 A)
-        
-        tabulated_hopping_distance = hopping_distance
-        tabulated_hopping = hopping
-        tabulated_power_ss = power_ss
-        tabulated_power_ds = power_ds
-        tabulated_power_dd = power_dd
-        tabulated_power_gamma_ds = power_gamma_ds
-        tabulated_power_gamma_dd = power_gamma_dd
         
         moment_predictions = self._run_ensemble(
             atom_fea=atom_fea,
@@ -709,79 +689,6 @@ class Regression:
             torch.stack(batch_target, dim=0),\
             batch_cif_ids
 
-class ConvLayer(nn.Module):
-    '''
-    Convolutional operation on graphs
-    '''
-    def __init__(self, atom_fea_len, nbr_fea_len):
-        '''
-        Initialize ConvLayer.
-
-        Parameters
-        ----------
-
-        atom_fea_len: int
-          Number of atom hidden features.
-        nbr_fea_len: int
-          Number of bond features.
-        '''
-        super(ConvLayer, self).__init__()
-        self.atom_fea_len = atom_fea_len
-        self.nbr_fea_len = nbr_fea_len
-        self.fc_full = nn.Linear(2*self.atom_fea_len+self.nbr_fea_len,
-                                 2*self.atom_fea_len)
-        self.sigmoid = nn.Sigmoid()
-        self.softplus1 = nn.Softplus()
-        self.bn1 = nn.BatchNorm1d(2*self.atom_fea_len)
-        self.bn2 = nn.BatchNorm1d(self.atom_fea_len)
-        self.softplus2 = nn.Softplus()
-
-    def forward(self, atom_in_fea, nbr_fea, nbr_fea_idx, padding_filter):
-        '''
-        Forward pass
-
-        N: Total number of atoms in the batch
-        M: Max number of neighbors
-
-        Parameters
-        ----------
-
-        atom_in_fea: (torch.Tensor) shape (N, atom_fea_len)
-          Atom hidden features before convolution
-        nbr_fea: (torch.Tensor) shape (N, M, nbr_fea_len)
-          Bond features of each atom's M neighbors
-        nbr_fea_idx: torch.LongTensor shape (N, M)
-          Indices of M neighbors of each atom
-
-        Returns
-        -------
-
-        atom_out_fea: torch.Tensor shape (N, atom_fea_len)
-          Atom hidden features after convolution
-
-        '''
-        # TODO will there be problems with the index zero padding?
-        N, M = nbr_fea_idx.shape
-        # convolution
-        atom_nbr_fea = atom_in_fea[nbr_fea_idx, :]
-        total_nbr_fea = torch.cat(
-            [atom_in_fea.unsqueeze(1).expand(N, M, self.atom_fea_len),
-             atom_nbr_fea, nbr_fea], dim=2)
-        total_gated_fea = self.fc_full(total_nbr_fea)
-        padding_filter_flatten = padding_filter.view(-1)
-        total_gated_fea = total_gated_fea.view(-1, self.atom_fea_len*2)
-        total_gated_fea_bn1 = self.bn1(total_gated_fea[torch.where(padding_filter_flatten==1)[0]])
-        total_gated_fea[torch.where(padding_filter_flatten==1)[0]] = total_gated_fea_bn1
-        total_gated_fea = total_gated_fea.view(N, M, self.atom_fea_len*2)
-        nbr_filter, nbr_core = total_gated_fea.chunk(2, dim=2)
-        nbr_filter = self.sigmoid(nbr_filter)
-        nbr_core = self.softplus1(nbr_core)
-        nbr_sumed = torch.sum(nbr_filter * nbr_core * padding_filter[:,:,None], dim=1)
-        nbr_sumed = self.bn2(nbr_sumed)
-        out = self.softplus2(atom_in_fea + nbr_sumed)
-        return out
-
-
 class CrystalGraphConvNet(nn.Module):
     '''
     Create a crystal graph convolutional neural network for predicting total
@@ -861,22 +768,7 @@ class CrystalGraphConvNet(nn.Module):
             for name, tensor_list in terms.items()
         }
 
-    @staticmethod
-    def _apply_tight_binding_corrections(raw_corrections, terms):
-        """Convert neural correction factors into a corrected hopping matrix."""
-        zeta = torch.nn.functional.softplus(raw_corrections[..., 2])
-        zeta = zeta[:, :, None, :, None]
-        gamma_ds = raw_corrections[..., 0][:, :, None, :, None]
-        gamma_dd = raw_corrections[..., 1][:, :, None, :, None]
-
-        corrected_power = (
-            torch.pow(zeta, 2.0 / 3.5) * terms['power_ss']
-            + zeta * terms['power_ds']
-            + torch.pow(zeta, 5.0 / 3.5) * terms['power_dd']
-            + gamma_ds * terms['power_gamma_ds']
-            + gamma_dd * terms['power_gamma_dd']
-        )
-        return terms['hopping'] * corrected_power
+    _apply_tight_binding_corrections = staticmethod(MomentModel.apply_corrections)
 
     def forward(
         self,
@@ -952,41 +844,17 @@ class CrystalGraphConvNet(nn.Module):
 
 
 class Moment:
+    """Adapter between the pretrained moment network and ``MomentModel``."""
 
-    def __init__(self, model_name, **kwargs):
-        # Initialize the class
+    def __init__(self, model_name, physics=None, **kwargs):
         if model_name == 'moment':
-            self.model_num_input = 3
-    
+            self.physics = MomentModel() if physics is None else physics
+            self.model_num_input = self.physics.n_latent
+
     def moment(self, bond_fea, out, **kwargs):
-        
-        hh2 = [torch.tensordot(h1, h1, ([2, 3], [0, 1])) for h1 in bond_fea]
-        hh3 = [torch.tensordot(h2, h1, ([2, 3], [0, 1])) for h2, h1 in zip(hh2, bond_fea)]
-        hh4 = [torch.tensordot(h3, h1, ([2, 3], [0, 1])) for h3, h1 in zip(hh3, bond_fea)]
-        
-        tinnet_m2 = torch.stack([torch.sum(torch.diag(h2[0, 1:, 0, 1:])) for h2 in hh2])
-        tinnet_m3 = torch.stack([torch.sum(torch.diag(h3[0, 1:, 0, 1:])) for h3 in hh3])
-        tinnet_m4 = torch.stack([torch.sum(torch.diag(h4[0, 1:, 0, 1:])) for h4 in hh4])
-        
-        idx = kwargs['batch_cif_ids']
-        
-        cuda = torch.cuda.is_available()
-        
-        if cuda:
-            idx = torch.from_numpy(np.array(idx, dtype=np.float32)).cuda()
-        else:
-            idx = torch.from_numpy(np.array(idx, dtype=np.float32))
-        
-        parm = torch.stack((idx,
-                            tinnet_m2,
-                            tinnet_m3,
-                            tinnet_m4)).T
-        
-        parm = torch.stack((tinnet_m2,
-                            tinnet_m3,
-                            tinnet_m4)).T
-        
-        tinnet_m2 = tinnet_m2.view(len(tinnet_m2),-1)
+        """Return ``(m2 (B, 1), moments (B, 3), raw corrections, moments)``."""
+        parm = self.physics.moments(bond_fea)
+        tinnet_m2 = parm[:, 0].view(len(parm), -1)
         return tinnet_m2, parm, out, parm
 
 

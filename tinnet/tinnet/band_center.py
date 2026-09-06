@@ -13,46 +13,38 @@ import torch
 import torch.nn as nn
 
 try:
+    from .gnn import ConvLayer
+    from .physics import RectangularBandModel, hopping_couplings
     from .tinnet_utils import (
         atom_features,
-        as_float_tensor,
         material_properties,
-        as_long_tensor,
         copy_without_adsorbates,
-        data_path,
         load_checkpoint_state,
         normalize_atom_index,
-        normalize_site_indices,
         pretrained_path,
         set_publication_style,
         signed_label,
         signed_color,
         save_figure,
-        stack_scalar_parameters,
         torch_device,
         validate_atom_index,
-        values_for_symbols,
     )
 except ImportError:  # Allows running this file directly during debugging.
+    from gnn import ConvLayer
+    from physics import RectangularBandModel, hopping_couplings
     from tinnet_utils import (
         atom_features,
-        as_float_tensor,
         material_properties,
-        as_long_tensor,
         copy_without_adsorbates,
-        data_path,
         load_checkpoint_state,
         normalize_atom_index,
-        normalize_site_indices,
         pretrained_path,
         set_publication_style,
         signed_label,
         signed_color,
         save_figure,
-        stack_scalar_parameters,
         torch_device,
         validate_atom_index,
-        values_for_symbols,
     )
 
 
@@ -60,10 +52,11 @@ except ImportError:  # Allows running this file directly during debugging.
 class BandCenter:
     """Predict d-band filling, center, and full rectangular width.
 
-    This class wraps an ensemble of pretrained TinNet checkpoints.  The public
-    notebook-facing API is kept compatible with the original implementation,
-    while the repeated feature-construction and SHAP logic is centralized into
-    reusable helper methods.
+    The rectangular-band theory lives in
+    :class:`~tinnet.tinnet.physics.rectangular_band.RectangularBandModel`
+    (``self.physics``); this class builds the tabulated tight-binding inputs,
+    runs the pretrained ensemble through that theory module, and explains the
+    d-band center with SHAP on the physical parameter vector.
     """
 
     N_ENSEMBLE_MODELS = 10
@@ -77,18 +70,11 @@ class BandCenter:
         'width': 2,
     }
 
-    SHAP_LABELS = [
-        r'$(\alpha, \xi)$',
-        r'$d_{ij}$',
-        r'$\zeta$',
-        r'$(\lambda, r_{dj})$',
-        r'$(\beta, \Delta\chi)$',
-    ]
-
     def __init__(self,
                  image=None,
                  atom_inx=None,
                  name='Name'):
+        self.physics = RectangularBandModel(max_neighbors=self.MAX_NEIGHBORS)
         self.descriptor = Features(radius=8,
                                    dmin=0,
                                    step=0.2,
@@ -246,12 +232,9 @@ class BandCenter:
         neighbor_radii = np.array([self.material_dict[sym]['rd']
                                    for sym in neighbor_symbols])
 
-        vds = site_radius**1.5 / neighbor_distances**3.5
-        vdd = site_radius**1.5 * neighbor_radii**1.5 / neighbor_distances**5.0
-        tabulated_v2ds = self._pad(9.9856 * vds**2.0 * 7.62**2,
-                                   self.MAX_NEIGHBORS)
-        tabulated_v2dd = self._pad(415.565 * vdd**2.0 * 7.62**2,
-                                   self.MAX_NEIGHBORS)
+        v2ds, v2dd = hopping_couplings(site_radius, neighbor_radii, neighbor_distances)
+        tabulated_v2ds = self._pad(v2ds, self.MAX_NEIGHBORS)
+        tabulated_v2dd = self._pad(v2dd, self.MAX_NEIGHBORS)
         tabulated_d_ij = self._pad(neighbor_distances,
                                    self.MAX_NEIGHBORS,
                                    constant=1.0e6)
@@ -328,6 +311,7 @@ class BandCenter:
             context['nbr_fea'],
             context['nbr_fea_idx'],
             idx_model=idx_model,
+            physics=self.physics,
             tabulated_filling_inf=context['tabulated_filling_inf'],
             tabulated_d_cen_inf=context['tabulated_d_cen_inf'],
             tabulated_padding_fillter=context['tabulated_padding_filter'],
@@ -373,30 +357,9 @@ class BandCenter:
             model_parameters[3],   # beta and alpha neural state variables
         )))
 
-    @staticmethod
-    def _aggregate_d_center_shap(shap_values):
-        """Aggregate raw SHAP values into physical effect categories.
-
-        Input feature layout:
-        0       : site d-orbital radius
-        1:87    : neighbor d-orbital radii       -> ligand effect
-        87:173  : sorted interatomic distances   -> strain effect
-        173     : tabulated bulk d-band center
-        174     : tabulated bulk full width
-        175     : Mulliken electronegativity diff -> charge transfer
-        176:262 : padding/filter flags
-        262:348 : zeta relaxation coefficients   -> local relaxation
-        348     : beta charge-transfer variable   -> charge transfer
-        349     : alpha resonance variable        -> resonance
-        """
-        raw = np.asarray(shap_values)
-        return np.array([
-            raw[:, 349].sum(),                 # resonance
-            raw[:, 87:173].sum(),              # strain: distances
-            raw[:, 262:348].sum(),             # relaxation: zeta
-            raw[:, 1:87].sum(),                # ligand: neighbor radii
-            raw[:, 348].sum() + raw[:, 175].sum(),  # charge transfer
-        ])
+    def _aggregate_d_center_shap(self, shap_values):
+        """Aggregate raw SHAP values into the five physical effects (see ``self.physics``)."""
+        return self.physics.aggregate_effects(shap_values)
 
     def gen_shap(self,
                  ref_image,
@@ -426,31 +389,12 @@ class BandCenter:
         return np.asarray(rows).T
 
     def tinnet_d_center(self, inp_shap):
-        """Evaluate the analytical d-band-center expression used by SHAP."""
-        inp = np.asarray(inp_shap, dtype=float)
-        site_radius = inp[:, 0]
-        neighbor_radii = inp[:, 1:87]
-        distances = inp[:, 87:173]
-        bulk_center = inp[:, 173]
-        bulk_width = inp[:, 174]
-        mulliken_diff = inp[:, 175]
-        padding_filter = inp[:, 176:262]
-        zeta = inp[:, 262:348]
-        beta = inp[:, 348]
-        alpha = inp[:, 349]
+        """Analytical d-band-center expression on the physical parameter vector (SHAP model)."""
+        return self.physics.shap_function(inp_shap)
 
-        vds = site_radius[:, None]**1.5 / distances**3.5
-        vdd = site_radius[:, None]**1.5 * neighbor_radii**1.5 / distances**5.0
-        v2ds = 9.9856 * vds**2.0 * 7.62**2 * padding_filter
-        v2dd = 415.565 * vdd**2.0 * 7.62**2 * padding_filter
-
-        second_moment = np.sum(v2ds / zeta**7.0 + v2dd / zeta**10.0, axis=1)
-        d_center = (
-            alpha
-            * np.sqrt(second_moment)
-            * (bulk_center / bulk_width - beta * mulliken_diff)
-        )
-        return np.atleast_1d(d_center)
+    @property
+    def SHAP_LABELS(self):
+        return list(self.physics.effect_labels.values())
 
     # ------------------------------------------------------------------
     # Plotting
@@ -573,11 +517,12 @@ class Prediction:
                  tabulated_site_index=None,
                  tabulated_v2dd=None,
                  tabulated_v2ds=None,
+                 physics=None,
                  **kwargs
                  ):
         
         # Initialize Physical Model
-        Moment.__init__(self, phys_model, **kwargs)
+        Moment.__init__(self, phys_model, physics=physics, **kwargs)
         
         device = torch_device()
         cuda = device.type == 'cuda'
@@ -674,79 +619,6 @@ class Prediction:
         if return_all_parm:
             return self._numpy_bundle(output, parm, zeta, crys_fea)
         return parm.detach().cpu().numpy()
-
-
-class ConvLayer(nn.Module):
-    '''
-    Convolutional operation on graphs
-    '''
-    def __init__(self, atom_fea_len, nbr_fea_len):
-        '''
-        Initialize ConvLayer.
-
-        Parameters
-        ----------
-
-        atom_fea_len: int
-          Number of atom hidden features.
-        nbr_fea_len: int
-          Number of bond features.
-        '''
-        super(ConvLayer, self).__init__()
-        self.atom_fea_len = atom_fea_len
-        self.nbr_fea_len = nbr_fea_len
-        self.fc_full = nn.Linear(2*self.atom_fea_len+self.nbr_fea_len,
-                                 2*self.atom_fea_len)
-        self.sigmoid = nn.Sigmoid()
-        self.softplus1 = nn.Softplus()
-        self.bn1 = nn.BatchNorm1d(2*self.atom_fea_len)
-        self.bn2 = nn.BatchNorm1d(self.atom_fea_len)
-        self.softplus2 = nn.Softplus()
-
-    def forward(self, atom_in_fea, nbr_fea, nbr_fea_idx, tabulated_padding_fillter):
-        '''
-        Forward pass
-
-        N: Total number of atoms in the batch
-        M: Max number of neighbors
-
-        Parameters
-        ----------
-
-        atom_in_fea: (torch.Tensor) shape (N, atom_fea_len)
-          Atom hidden features before convolution
-        nbr_fea: (torch.Tensor) shape (N, M, nbr_fea_len)
-          Bond features of each atom's M neighbors
-        nbr_fea_idx: torch.LongTensor shape (N, M)
-          Indices of M neighbors of each atom
-
-        Returns
-        -------
-
-        atom_out_fea: torch.Tensor shape (N, atom_fea_len)
-          Atom hidden features after convolution
-
-        '''
-        # TODO will there be problems with the index zero padding?
-        N, M = nbr_fea_idx.shape
-        # convolution
-        atom_nbr_fea = atom_in_fea[nbr_fea_idx, :]
-        total_nbr_fea = torch.cat(
-            [atom_in_fea.unsqueeze(1).expand(N, M, self.atom_fea_len),
-             atom_nbr_fea, nbr_fea], dim=2)
-        total_gated_fea = self.fc_full(total_nbr_fea)
-        tabulated_padding_fillter_flatten = tabulated_padding_fillter.view(-1)
-        total_gated_fea = total_gated_fea.view(-1, self.atom_fea_len*2)
-        total_gated_fea_bn1 = self.bn1(total_gated_fea[torch.where(tabulated_padding_fillter_flatten==1)[0]])
-        total_gated_fea[torch.where(tabulated_padding_fillter_flatten==1)[0]] = total_gated_fea_bn1
-        total_gated_fea = total_gated_fea.view(N, M, self.atom_fea_len*2)
-        nbr_filter, nbr_core = total_gated_fea.chunk(2, dim=2)
-        nbr_filter = self.sigmoid(nbr_filter)
-        nbr_core = self.softplus1(nbr_core)
-        nbr_sumed = torch.sum(nbr_filter * nbr_core * tabulated_padding_fillter[:,:,None], dim=1)
-        nbr_sumed = self.bn2(nbr_sumed)
-        out = self.softplus2(atom_in_fea + nbr_sumed)
-        return out
 
 
 class CrystalGraphConvNet(nn.Module):
@@ -864,47 +736,33 @@ class CrystalGraphConvNet(nn.Module):
 
 
 class Moment:
+    """Adapter between the pretrained band-center network and ``RectangularBandModel``."""
 
-    def __init__(self, model_name, **kwargs):
-        # Initialize the class
+    def __init__(self, model_name, physics=None, **kwargs):
         if model_name == 'moment':
+            self.physics = RectangularBandModel() if physics is None else physics
             self.model_num_input = 1
-    
+
     def moment(self, bond_fea, crys_fea, **kwargs):
-        
-        tabulated_filling_inf = self.tabulated_filling_inf
-        tabulated_d_cen_inf = self.tabulated_d_cen_inf
-        tabulated_full_width_inf = self.tabulated_full_width_inf
-        tabulated_mulliken = self.tabulated_mulliken
-        tabulated_site_index = self.tabulated_site_index
-        tabulated_v2dd = self.tabulated_v2dd
-        tabulated_v2ds = self.tabulated_v2ds
-        
-        zeta = bond_fea[tabulated_site_index][:,0]
-        zeta = torch.nn.functional.softplus(zeta)
-        
-        filling_tinnet = torch.sigmoid(crys_fea[:,2])
-        
-        alpha = crys_fea[:,0] # elect. transf
-        beta = torch.nn.functional.softplus(crys_fea[:,1]) # resonance
-        
-        crys_fea = torch.stack((alpha, beta)).flatten()
-        
-        m2 = torch.sum(tabulated_v2ds / zeta
-                     + tabulated_v2dd / zeta**(10.0/7.0))
-        
-        full_width_tinnet = (12*m2)**0.5
-        
-        d_cen_tinnet = (beta
-                        * m2**0.5
-                        * (tabulated_d_cen_inf / tabulated_full_width_inf
-                           - alpha * tabulated_mulliken))
-        
-        parm = torch.stack([filling_tinnet,
-                            d_cen_tinnet,
-                            torch.atleast_1d(full_width_tinnet)])
-        
-        return d_cen_tinnet, parm, zeta, crys_fea
+        """Return ``(d_cen, [filling, d_cen, full_width], zeta, [alpha, beta])``.
+
+        ``bond_fea`` holds one raw relaxation output per bond ``(N, M, 1)`` and
+        ``crys_fea`` the three site-level outputs ``(1, 3)``; they are
+        concatenated into the latent vector expected by the theory module.
+        """
+        zeta_raw = bond_fea[self.tabulated_site_index][:, 0]
+        latent = torch.cat((torch.atleast_2d(zeta_raw), crys_fea), dim=1)
+        constants = dict(
+            v2ds=torch.atleast_2d(self.tabulated_v2ds),
+            v2dd=torch.atleast_2d(self.tabulated_v2dd),
+            bulk_center=self.tabulated_d_cen_inf,
+            bulk_width=self.tabulated_full_width_inf,
+            mulliken=self.tabulated_mulliken,
+        )
+        s = self.physics.band_properties(latent, constants)
+        parm = torch.stack([s['filling'], s['d_cen'], torch.atleast_1d(s['full_width'])])
+        crys_out = torch.stack((s['alpha'], s['beta'])).flatten()
+        return s['d_cen'], parm, s['zeta'].flatten(), crys_out
 
 
 class Features:

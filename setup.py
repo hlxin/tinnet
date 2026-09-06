@@ -18,6 +18,7 @@ setup(
     extras_require={
         "dev": ["pytest", "black", "flake8"],
         "notebooks": ["jupyter", "nglview"],
+        "oc20": ["torch>=2.0", "lmdb", "torch-geometric"],
     },
     classifiers=[
         "Programming Language :: Python :: 3",

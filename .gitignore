@@ -78,6 +78,8 @@ dmypy.json
 #*.pkl
 *.h5
 #*.npz
+/data/oc20_tutorial/
+/runs/
 
 # MacOS
 .DS_Store
