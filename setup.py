@@ -5,15 +5,16 @@ setup(
     version="1.4.0",
     description="AI with Chemostructural Embeddings of Multimodality for Integrated Catalysis",
     author="Xin Group",
-    author_email="hongliang06@gmail.com",  # Replace with your preferred contact
-    url="https://github.com/hlxin/tinnet",  # Replace with the actual URL
+    author_email="hongliang06@gmail.com",
+    url="https://github.com/hlxin/tinnet",
     packages=find_packages(exclude=["tests", "docs"]),
     install_requires=[
-        "torch>=1.10",  # Specify minimum version if needed
+        "torch>=1.10",
         "numpy",
         "pymatgen",
-        "shap",  # Assuming SHAP explainability is used
-        "ase",   # If Atomic Simulation Environment is required
+        "shap",
+        "ase",
+        "matplotlib",
     ],
     extras_require={
         "dev": ["pytest", "black", "flake8"],

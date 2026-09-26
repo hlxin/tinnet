@@ -12,6 +12,8 @@ from torch.autograd import Variable
 from ase import io
 from pylab import *
 
+from ._paths import data_path
+
 
 class BandCenter:
     def __init__(self,
@@ -891,11 +893,11 @@ class BandCenter:
         x2 = x3 + dx3
         x1 = x2 + dx2
         
-        c5 = (shap[2] < 0) * 'red' + (shap[2] >= 0) * 'blue'
-        c4 = (shap[3] < 0) * 'red' + (shap[3] >= 0) * 'blue'
-        c3 = (shap[4] < 0) * 'red' + (shap[4] >= 0) * 'blue'
-        c2 = (shap[5] < 0) * 'red' + (shap[5] >= 0) * 'blue'
-        c1 = (shap[6] < 0) * 'red' + (shap[6] >= 0) * 'blue'
+        c5 = 'red' if shap[2] < 0 else 'blue'
+        c4 = 'red' if shap[3] < 0 else 'blue'
+        c3 = 'red' if shap[4] < 0 else 'blue'
+        c2 = 'red' if shap[5] < 0 else 'blue'
+        c1 = 'red' if shap[6] < 0 else 'blue'
         
         ax.arrow(x=x5, y=5, dx=dx5, dy=0, color=c5, width=1.0/3.0,
                  head_width=1.0/3.0, head_length=0.15*np.abs(dx5),
@@ -939,11 +941,11 @@ class BandCenter:
                     arrowprops=dict(arrowstyle='-[, widthB=3.0, lengthB=1.0'),
                     ha='center', va='center')
         
-        sym_5 = (shap[2] < 0) * '-' + (shap[2] >= 0) * '+'
-        sym_4 = (shap[3] < 0) * '-' + (shap[3] >= 0) * '+'
-        sym_3 = (shap[4] < 0) * '-' + (shap[4] >= 0) * '+'
-        sym_2 = (shap[5] < 0) * '-' + (shap[5] >= 0) * '+'
-        sym_1 = (shap[6] < 0) * '-' + (shap[6] >= 0) * '+'
+        sym_5 = '-' if shap[2] < 0 else '+'
+        sym_4 = '-' if shap[3] < 0 else '+'
+        sym_3 = '-' if shap[4] < 0 else '+'
+        sym_2 = '-' if shap[5] < 0 else '+'
+        sym_1 = '-' if shap[6] < 0 else '+'
         
         ax.annotate(sym_5 + '{:.2f}'.format(round(np.abs(shap[2]), 4)),
                     xy=(-0.12, 4.70), xycoords=('axes fraction', 'data'),
@@ -1079,9 +1081,9 @@ class Prediction:
                       **kwargs):
         
         if self.cuda:
-            best_checkpoint = torch.load('./data/pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar')
+            best_checkpoint = torch.load(data_path('pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar'))
         else:
-            best_checkpoint = torch.load('./data/pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar', map_location=torch.device('cpu'))
+            best_checkpoint = torch.load(data_path('pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar'), map_location=torch.device('cpu'))
         
         self.model.load_state_dict(best_checkpoint['state_dict'])
         
@@ -1126,9 +1128,9 @@ class Prediction:
                            **kwargs):
         
         if self.cuda:
-            best_checkpoint = torch.load('./data/pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar')
+            best_checkpoint = torch.load(data_path('pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar'))
         else:
-            best_checkpoint = torch.load('./data/pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar', map_location=torch.device('cpu'))
+            best_checkpoint = torch.load(data_path('pretrained/band_center/model_' + str(self.idx_model) + '.pth.tar'), map_location=torch.device('cpu'))
         
         self.model.load_state_dict(best_checkpoint['state_dict'])
         
@@ -2106,7 +2108,7 @@ class Features:
                           #'Zn':{'d_cen':-7.3926, 'full_width': 2.4747, 'bulk_filling': 9.979212627042637340e-01},
                           'Zr':{'d_cen': 1.6485, 'full_width': 8.9050, 'rd': 1.0710710710710711, 'bulk_filling': 2.920224652312821134e-01}}
         
-        with open('./data/MaterialDict.pkl', 'rb') as f:
+        with open(data_path('MaterialDict.pkl'), 'rb') as f:
             data = pickle.load(f, encoding='bytes')
         data = {k.decode('utf8'): v for k, v in data.items()}
         

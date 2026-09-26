@@ -28,6 +28,8 @@ from torch.utils.data.sampler import SubsetRandomSampler
 from pymatgen.analysis.structure_analyzer import VoronoiConnectivity
 from pymatgen.io.ase import AseAtomsAdaptor
 
+from ._paths import data_path
+
 
 class CohesiveEnergy:
     def __init__(self,
@@ -239,10 +241,10 @@ class CohesiveEnergy:
         x2 = x3 + dx3
         x1 = x2 + dx2
         
-        c4 = (shap[2] < 0) * 'red' + (shap[2] >= 0) * 'blue'
-        c3 = (shap[3] < 0) * 'red' + (shap[3] >= 0) * 'blue'
-        c2 = (shap[4] < 0) * 'red' + (shap[4] >= 0) * 'blue'
-        c1 = (shap[5] < 0) * 'red' + (shap[5] >= 0) * 'blue'
+        c4 = 'red' if shap[2] < 0 else 'blue'
+        c3 = 'red' if shap[3] < 0 else 'blue'
+        c2 = 'red' if shap[4] < 0 else 'blue'
+        c1 = 'red' if shap[5] < 0 else 'blue'
         
         ax.arrow(x=x4, y=4, dx=dx4, dy=0, color=c4, width=1.0/3.0,
                  head_width=1.0/3.0, head_length=0.15*np.abs(dx4),
@@ -261,10 +263,10 @@ class CohesiveEnergy:
         
         plt.yticks([4,3,2,1], labels)
         
-        sym_4 = (shap[2] < 0) * '-' + (shap[2] >= 0) * '+'
-        sym_3 = (shap[3] < 0) * '-' + (shap[3] >= 0) * '+'
-        sym_2 = (shap[4] < 0) * '-' + (shap[4] >= 0) * '+'
-        sym_1 = (shap[5] < 0) * '-' + (shap[5] >= 0) * '+'
+        sym_4 = '-' if shap[2] < 0 else '+'
+        sym_3 = '-' if shap[3] < 0 else '+'
+        sym_2 = '-' if shap[4] < 0 else '+'
+        sym_1 = '-' if shap[5] < 0 else '+'
         
         ax.annotate(sym_4 + '{:.2f}'.format(round(np.abs(shap[2]), 4)),
                     xy=(-0.12, 4.00), xycoords=('axes fraction', 'data'),
@@ -534,9 +536,9 @@ class Regression:
     def predict(self, **kwargs):
         # test best model
         if self.cuda:
-            best_checkpoint = torch.load('./data/pretrained/cohesive_energy/model_' + str(self.model_inx) + '.pth.tar')
+            best_checkpoint = torch.load(data_path('pretrained/cohesive_energy/model_' + str(self.model_inx) + '.pth.tar'))
         else:
-            best_checkpoint = torch.load('./data/pretrained/cohesive_energy/model_' + str(self.model_inx) + '.pth.tar', map_location=torch.device('cpu'))
+            best_checkpoint = torch.load(data_path('pretrained/cohesive_energy/model_' + str(self.model_inx) + '.pth.tar'), map_location=torch.device('cpu'))
         
         self.model.load_state_dict(best_checkpoint['state_dict'])
         

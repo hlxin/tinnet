@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler
 
+from ._paths import data_path
 from .band_center import BandCenter
 
 
@@ -544,18 +545,18 @@ class AdsorptionEnergy:
             x2 = x3 + dx3
             x1 = x2 + dx2
             
-            c12 = (shap[2] < 0) * 'red' + (shap[2] >= 0) * 'blue'
-            c11 = (shap[3] < 0) * 'red' + (shap[3] >= 0) * 'blue'
-            c10 = (shap[4] < 0) * 'red' + (shap[4] >= 0) * 'blue'
-            c9 = (shap[5] < 0) * 'red' + (shap[5] >= 0) * 'blue'
-            c8 = (shap[6] < 0) * 'red' + (shap[6] >= 0) * 'blue'
-            c7 = (shap[7] < 0) * 'red' + (shap[7] >= 0) * 'blue'
-            c6 = (shap[8] < 0) * 'red' + (shap[8] >= 0) * 'blue'
-            c5 = (shap[9] < 0) * 'red' + (shap[9] >= 0) * 'blue'
-            c4 = (shap[10] < 0) * 'red' + (shap[10] >= 0) * 'blue'
-            c3 = (shap[11] < 0) * 'red' + (shap[11] >= 0) * 'blue'
-            c2 = (shap[12] < 0) * 'red' + (shap[12] >= 0) * 'blue'
-            c1 = (shap[13] < 0) * 'red' + (shap[13] >= 0) * 'blue'
+            c12 = 'red' if shap[2] < 0 else 'blue'
+            c11 = 'red' if shap[3] < 0 else 'blue'
+            c10 = 'red' if shap[4] < 0 else 'blue'
+            c9 = 'red' if shap[5] < 0 else 'blue'
+            c8 = 'red' if shap[6] < 0 else 'blue'
+            c7 = 'red' if shap[7] < 0 else 'blue'
+            c6 = 'red' if shap[8] < 0 else 'blue'
+            c5 = 'red' if shap[9] < 0 else 'blue'
+            c4 = 'red' if shap[10] < 0 else 'blue'
+            c3 = 'red' if shap[11] < 0 else 'blue'
+            c2 = 'red' if shap[12] < 0 else 'blue'
+            c1 = 'red' if shap[13] < 0 else 'blue'
             
             ax.arrow(x=x12, y=12, dx=dx12, dy=0, color=c12, width=1.0/3.0,
                      head_width=1.0/3.0, head_length=0.15*np.abs(dx12),
@@ -598,18 +599,18 @@ class AdsorptionEnergy:
             
             plt.yticks([12,11,10,9,8,7,6,5,4,3,2,1], labels)
             
-            sym_12 = (shap[2] < 0) * '-' + (shap[2] >= 0) * '+'
-            sym_11 = (shap[3] < 0) * '-' + (shap[3] >= 0) * '+'
-            sym_10 = (shap[4] < 0) * '-' + (shap[4] >= 0) * '+'
-            sym_9 = (shap[5] < 0) * '-' + (shap[5] >= 0) * '+'
-            sym_8 = (shap[6] < 0) * '-' + (shap[6] >= 0) * '+'
-            sym_7 = (shap[7] < 0) * '-' + (shap[7] >= 0) * '+'
-            sym_6 = (shap[8] < 0) * '-' + (shap[8] >= 0) * '+'
-            sym_5 = (shap[9] < 0) * '-' + (shap[9] >= 0) * '+'
-            sym_4 = (shap[10] < 0) * '-' + (shap[10] >= 0) * '+'
-            sym_3 = (shap[11] < 0) * '-' + (shap[11] >= 0) * '+'
-            sym_2 = (shap[12] < 0) * '-' + (shap[12] >= 0) * '+'
-            sym_1 = (shap[13] < 0) * '-' + (shap[13] >= 0) * '+'
+            sym_12 = '-' if shap[2] < 0 else '+'
+            sym_11 = '-' if shap[3] < 0 else '+'
+            sym_10 = '-' if shap[4] < 0 else '+'
+            sym_9 = '-' if shap[5] < 0 else '+'
+            sym_8 = '-' if shap[6] < 0 else '+'
+            sym_7 = '-' if shap[7] < 0 else '+'
+            sym_6 = '-' if shap[8] < 0 else '+'
+            sym_5 = '-' if shap[9] < 0 else '+'
+            sym_4 = '-' if shap[10] < 0 else '+'
+            sym_3 = '-' if shap[11] < 0 else '+'
+            sym_2 = '-' if shap[12] < 0 else '+'
+            sym_1 = '-' if shap[13] < 0 else '+'
             
             ax.annotate(sym_12 + '{:.2f}'.format(round(np.abs(shap[2]), 4)),
                         xy=(1.12, 12.00), xycoords=('axes fraction', 'data'),
@@ -648,31 +649,31 @@ class AdsorptionEnergy:
                         xy=(1.12, 1.00), xycoords=('axes fraction', 'data'),
                         ha='center', va='center', color=c1)
             
-            c12 = (parm_diff[0] < 0) * 'red' + (parm_diff[0] >= 0) * 'blue'
-            c11 = (parm_diff[1] < 0) * 'red' + (parm_diff[1] >= 0) * 'blue'
-            c10 = (parm_diff[2] < 0) * 'red' + (parm_diff[2] >= 0) * 'blue'
-            c9 = (parm_diff[3] < 0) * 'red' + (parm_diff[3] >= 0) * 'blue'
-            c8 = (parm_diff[4] < 0) * 'red' + (parm_diff[4] >= 0) * 'blue'
-            c7 = (parm_diff[5] < 0) * 'red' + (parm_diff[5] >= 0) * 'blue'
-            c6 = (parm_diff[6] < 0) * 'red' + (parm_diff[6] >= 0) * 'blue'
-            c5 = (parm_diff[7] < 0) * 'red' + (parm_diff[7] >= 0) * 'blue'
-            c4 = (parm_diff[8] < 0) * 'red' + (parm_diff[8] >= 0) * 'blue'
-            c3 = (parm_diff[9] < 0) * 'red' + (parm_diff[9] >= 0) * 'blue'
-            c2 = (parm_diff[10] < 0) * 'red' + (parm_diff[10] >= 0) * 'blue'
-            c1 = (parm_diff[11] < 0) * 'red' + (parm_diff[11] >= 0) * 'blue'
+            c12 = 'red' if parm_diff[0] < 0 else 'blue'
+            c11 = 'red' if parm_diff[1] < 0 else 'blue'
+            c10 = 'red' if parm_diff[2] < 0 else 'blue'
+            c9 = 'red' if parm_diff[3] < 0 else 'blue'
+            c8 = 'red' if parm_diff[4] < 0 else 'blue'
+            c7 = 'red' if parm_diff[5] < 0 else 'blue'
+            c6 = 'red' if parm_diff[6] < 0 else 'blue'
+            c5 = 'red' if parm_diff[7] < 0 else 'blue'
+            c4 = 'red' if parm_diff[8] < 0 else 'blue'
+            c3 = 'red' if parm_diff[9] < 0 else 'blue'
+            c2 = 'red' if parm_diff[10] < 0 else 'blue'
+            c1 = 'red' if parm_diff[11] < 0 else 'blue'
             
-            sym_12 = (parm_diff[0] < 0) * '-' + (parm_diff[0] >= 0) * '+'
-            sym_11 = (parm_diff[1] < 0) * '-' + (parm_diff[1] >= 0) * '+'
-            sym_10 = (parm_diff[2] < 0) * '-' + (parm_diff[2] >= 0) * '+'
-            sym_9 = (parm_diff[3] < 0) * '-' + (parm_diff[3] >= 0) * '+'
-            sym_8 = (parm_diff[4] < 0) * '-' + (parm_diff[4] >= 0) * '+'
-            sym_7 = (parm_diff[5] < 0) * '-' + (parm_diff[5] >= 0) * '+'
-            sym_6 = (parm_diff[6] < 0) * '-' + (parm_diff[6] >= 0) * '+'
-            sym_5 = (parm_diff[7] < 0) * '-' + (parm_diff[7] >= 0) * '+'
-            sym_4 = (parm_diff[8] < 0) * '-' + (parm_diff[8] >= 0) * '+'
-            sym_3 = (parm_diff[9] < 0) * '-' + (parm_diff[9] >= 0) * '+'
-            sym_2 = (parm_diff[10] < 0) * '-' + (parm_diff[10] >= 0) * '+'
-            sym_1 = (parm_diff[11] < 0) * '-' + (parm_diff[11] >= 0) * '+'
+            sym_12 = '-' if parm_diff[0] < 0 else '+'
+            sym_11 = '-' if parm_diff[1] < 0 else '+'
+            sym_10 = '-' if parm_diff[2] < 0 else '+'
+            sym_9 = '-' if parm_diff[3] < 0 else '+'
+            sym_8 = '-' if parm_diff[4] < 0 else '+'
+            sym_7 = '-' if parm_diff[5] < 0 else '+'
+            sym_6 = '-' if parm_diff[6] < 0 else '+'
+            sym_5 = '-' if parm_diff[7] < 0 else '+'
+            sym_4 = '-' if parm_diff[8] < 0 else '+'
+            sym_3 = '-' if parm_diff[9] < 0 else '+'
+            sym_2 = '-' if parm_diff[10] < 0 else '+'
+            sym_1 = '-' if parm_diff[11] < 0 else '+'
             
             ax.annotate(sym_12 + '{:.2f}'.format(round(np.abs(parm_diff[0]), 4)),
                         xy=(-0.12, 12.00), xycoords=('axes fraction', 'data'),
@@ -798,15 +799,15 @@ class AdsorptionEnergy:
             x2 = x3 + dx3
             x1 = x2 + dx2
             
-            c9 = (shap[2] < 0) * 'red' + (shap[2] >= 0) * 'blue'
-            c8 = (shap[3] < 0) * 'red' + (shap[3] >= 0) * 'blue'
-            c7 = (shap[4] < 0) * 'red' + (shap[4] >= 0) * 'blue'
-            c6 = (shap[5] < 0) * 'red' + (shap[5] >= 0) * 'blue'
-            c5 = (shap[6] < 0) * 'red' + (shap[6] >= 0) * 'blue'
-            c4 = (shap[7] < 0) * 'red' + (shap[7] >= 0) * 'blue'
-            c3 = (shap[8] < 0) * 'red' + (shap[8] >= 0) * 'blue'
-            c2 = (shap[9] < 0) * 'red' + (shap[9] >= 0) * 'blue'
-            c1 = (shap[10] < 0) * 'red' + (shap[10] >= 0) * 'blue'
+            c9 = 'red' if shap[2] < 0 else 'blue'
+            c8 = 'red' if shap[3] < 0 else 'blue'
+            c7 = 'red' if shap[4] < 0 else 'blue'
+            c6 = 'red' if shap[5] < 0 else 'blue'
+            c5 = 'red' if shap[6] < 0 else 'blue'
+            c4 = 'red' if shap[7] < 0 else 'blue'
+            c3 = 'red' if shap[8] < 0 else 'blue'
+            c2 = 'red' if shap[9] < 0 else 'blue'
+            c1 = 'red' if shap[10] < 0 else 'blue'
             
             ax.arrow(x=x9, y=9, dx=dx9, dy=0, color=c9, width=1.0/3.0,
                      head_width=1.0/3.0, head_length=0.15*np.abs(dx9),
@@ -840,15 +841,15 @@ class AdsorptionEnergy:
             
             plt.yticks([9,8,7,6,5,4,3,2,1], labels)
             
-            sym_9 = (shap[2] < 0) * '-' + (shap[2] >= 0) * '+'
-            sym_8 = (shap[3] < 0) * '-' + (shap[3] >= 0) * '+'
-            sym_7 = (shap[4] < 0) * '-' + (shap[4] >= 0) * '+'
-            sym_6 = (shap[5] < 0) * '-' + (shap[5] >= 0) * '+'
-            sym_5 = (shap[6] < 0) * '-' + (shap[6] >= 0) * '+'
-            sym_4 = (shap[7] < 0) * '-' + (shap[7] >= 0) * '+'
-            sym_3 = (shap[8] < 0) * '-' + (shap[8] >= 0) * '+'
-            sym_2 = (shap[9] < 0) * '-' + (shap[9] >= 0) * '+'
-            sym_1 = (shap[10] < 0) * '-' + (shap[10] >= 0) * '+'
+            sym_9 = '-' if shap[2] < 0 else '+'
+            sym_8 = '-' if shap[3] < 0 else '+'
+            sym_7 = '-' if shap[4] < 0 else '+'
+            sym_6 = '-' if shap[5] < 0 else '+'
+            sym_5 = '-' if shap[6] < 0 else '+'
+            sym_4 = '-' if shap[7] < 0 else '+'
+            sym_3 = '-' if shap[8] < 0 else '+'
+            sym_2 = '-' if shap[9] < 0 else '+'
+            sym_1 = '-' if shap[10] < 0 else '+'
             
             ax.annotate(sym_9 + '{:.2f}'.format(round(np.abs(shap[2]), 4)),
                         xy=(1.12, 9.00), xycoords=('axes fraction', 'data'),
@@ -878,25 +879,25 @@ class AdsorptionEnergy:
                         xy=(1.12, 1.00), xycoords=('axes fraction', 'data'),
                         ha='center', va='center', color=c1)
             
-            c9 = (parm_diff[0] < 0) * 'red' + (parm_diff[0] >= 0) * 'blue'
-            c8 = (parm_diff[1] < 0) * 'red' + (parm_diff[1] >= 0) * 'blue'
-            c7 = (parm_diff[2] < 0) * 'red' + (parm_diff[2] >= 0) * 'blue'
-            c6 = (parm_diff[3] < 0) * 'red' + (parm_diff[3] >= 0) * 'blue'
-            c5 = (parm_diff[4] < 0) * 'red' + (parm_diff[4] >= 0) * 'blue'
-            c4 = (parm_diff[5] < 0) * 'red' + (parm_diff[5] >= 0) * 'blue'
-            c3 = (parm_diff[6] < 0) * 'red' + (parm_diff[6] >= 0) * 'blue'
-            c2 = (parm_diff[7] < 0) * 'red' + (parm_diff[7] >= 0) * 'blue'
-            c1 = (parm_diff[8] < 0) * 'red' + (parm_diff[8] >= 0) * 'blue'
+            c9 = 'red' if parm_diff[0] < 0 else 'blue'
+            c8 = 'red' if parm_diff[1] < 0 else 'blue'
+            c7 = 'red' if parm_diff[2] < 0 else 'blue'
+            c6 = 'red' if parm_diff[3] < 0 else 'blue'
+            c5 = 'red' if parm_diff[4] < 0 else 'blue'
+            c4 = 'red' if parm_diff[5] < 0 else 'blue'
+            c3 = 'red' if parm_diff[6] < 0 else 'blue'
+            c2 = 'red' if parm_diff[7] < 0 else 'blue'
+            c1 = 'red' if parm_diff[8] < 0 else 'blue'
             
-            sym_9 = (parm_diff[0] < 0) * '-' + (parm_diff[0] >= 0) * '+'
-            sym_8 = (parm_diff[1] < 0) * '-' + (parm_diff[1] >= 0) * '+'
-            sym_7 = (parm_diff[2] < 0) * '-' + (parm_diff[2] >= 0) * '+'
-            sym_6 = (parm_diff[3] < 0) * '-' + (parm_diff[3] >= 0) * '+'
-            sym_5 = (parm_diff[4] < 0) * '-' + (parm_diff[4] >= 0) * '+'
-            sym_4 = (parm_diff[5] < 0) * '-' + (parm_diff[5] >= 0) * '+'
-            sym_3 = (parm_diff[6] < 0) * '-' + (parm_diff[6] >= 0) * '+'
-            sym_2 = (parm_diff[7] < 0) * '-' + (parm_diff[7] >= 0) * '+'
-            sym_1 = (parm_diff[8] < 0) * '-' + (parm_diff[8] >= 0) * '+'
+            sym_9 = '-' if parm_diff[0] < 0 else '+'
+            sym_8 = '-' if parm_diff[1] < 0 else '+'
+            sym_7 = '-' if parm_diff[2] < 0 else '+'
+            sym_6 = '-' if parm_diff[3] < 0 else '+'
+            sym_5 = '-' if parm_diff[4] < 0 else '+'
+            sym_4 = '-' if parm_diff[5] < 0 else '+'
+            sym_3 = '-' if parm_diff[6] < 0 else '+'
+            sym_2 = '-' if parm_diff[7] < 0 else '+'
+            sym_1 = '-' if parm_diff[8] < 0 else '+'
             
             ax.annotate(sym_9 + '{:.2f}'.format(round(np.abs(parm_diff[0]), 4)),
                         xy=(-0.12, 9.00), xycoords=('axes fraction', 'data'),
@@ -1068,9 +1069,9 @@ class Regression:
     def eval_model(self, **kwargs):
         if self.phys_model == 'OH_atop':
             if self.cuda:
-                best_checkpoint = torch.load('./data/pretrained/adsorption_energy/OH/atop/model_' + str(self.model_inx) + '.pth.tar')
+                best_checkpoint = torch.load(data_path('pretrained/adsorption_energy/OH/atop/model_' + str(self.model_inx) + '.pth.tar'))
             else:
-                best_checkpoint = torch.load('./data/pretrained/adsorption_energy/OH/atop/model_' + str(self.model_inx) + '.pth.tar', map_location=torch.device('cpu'))
+                best_checkpoint = torch.load(data_path('pretrained/adsorption_energy/OH/atop/model_' + str(self.model_inx) + '.pth.tar'), map_location=torch.device('cpu'))
             
             self.model.load_state_dict(best_checkpoint['state_dict'])
             
@@ -1106,9 +1107,9 @@ class Regression:
             return output, parm
         if self.phys_model == 'O_atop':
             if self.cuda:
-                best_checkpoint = torch.load('./data/pretrained/adsorption_energy/O/atop/model_' + str(self.model_inx) + '.pth.tar')
+                best_checkpoint = torch.load(data_path('pretrained/adsorption_energy/O/atop/model_' + str(self.model_inx) + '.pth.tar'))
             else:
-                best_checkpoint = torch.load('./data/pretrained/adsorption_energy/O/atop/model_' + str(self.model_inx) + '.pth.tar', map_location=torch.device('cpu'))
+                best_checkpoint = torch.load(data_path('pretrained/adsorption_energy/O/atop/model_' + str(self.model_inx) + '.pth.tar'), map_location=torch.device('cpu'))
             
             self.model.load_state_dict(best_checkpoint['state_dict'])
             

@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.sampler import SubsetRandomSampler
 
+from ._paths import data_path
+
 
 class BandMoments:
     def __init__(self,
@@ -498,9 +500,9 @@ class Regression:
     def check_loss(self, **kwargs):
         # test best model
         if self.cuda:
-            best_checkpoint = torch.load('./data/pretrained/band_moments/model_' + str(self.model_inx) + '.pth.tar')
+            best_checkpoint = torch.load(data_path('pretrained/band_moments/model_' + str(self.model_inx) + '.pth.tar'))
         else:
-            best_checkpoint = torch.load('./data/pretrained/band_moments/model_' + str(self.model_inx) + '.pth.tar', map_location=torch.device('cpu'))
+            best_checkpoint = torch.load(data_path('pretrained/band_moments/model_' + str(self.model_inx) + '.pth.tar'), map_location=torch.device('cpu'))
         
         self.model.load_state_dict(best_checkpoint['state_dict'])
         
@@ -1570,7 +1572,7 @@ class Features:
                           #'Zn':{'d_cen':-7.3926, 'full_width': 2.4747, },
                           'Zr':{'d_cen': 1.6485, 'full_width': 8.9050, 'rd': 1.0710710710710711 }}
         
-        with open('./data/MaterialDict.pkl', 'rb') as f:
+        with open(data_path('MaterialDict.pkl'), 'rb') as f:
             data = pickle.load(f, encoding='bytes')
         data = {k.decode('utf8'): v for k, v in data.items()}
         
