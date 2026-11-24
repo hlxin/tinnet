@@ -49,11 +49,15 @@ def structures():
 
 
 # Ensemble means/stds recorded from the original implementation (see notebook).
+# The cohesive-energy reference was re-recorded after the cohesion theory module
+# was corrected (conduction-band prefactor in eV A^2 and the alpha/beta roles of
+# the April 2026 checkpoints); the original implementation returned -5.65 eV/atom
+# because its conduction-band term evaluated to ~1e-20 eV.
 REFERENCE = {
     "OH_atop_Pt_MLPt3Co111": (-1.848, 0.04),
     "O_atop_Cu1Ag": (-3.24, 0.04),
     "band_center_Cu1Ag": (-1.97, 0.02),
-    "cohesive_Cu_dimer_Ag": (-5.65, 0.02),
+    "cohesive_Cu_dimer_Ag": (-2.428, 0.02),
     "moments_Cu1Ag": ((0.85, 0.56, 11.98), (0.03, 0.03, 0.59)),
 }
 
@@ -87,6 +91,22 @@ def test_cohesive_energy(structures):
     parm = model.predict(return_all_parm=True)
     np.testing.assert_allclose(ech.mean(), REFERENCE["cohesive_Cu_dimer_Ag"][0], atol=1e-2)
     np.testing.assert_allclose(parm[:, 1:].sum(axis=1), parm[:, 0], atol=1e-4)
+    # physical sanity: an Ag-based slab binds by about 2.5 eV/atom (DFT-PBE), and the
+    # conduction-band term (column 3: E_s) is a few eV per atom, not numerically zero
+    assert -3.0 < ech.mean() < -2.0
+    assert 2.0 < parm[:, 3].mean() < 6.0
+
+
+def test_cohesive_energy_pure_coinage_metals(structures):
+    """Pure fcc(111) slabs: the model should stay close to DFT-PBE slab cohesive energies."""
+    expected = {"Cu": -3.31, "Ag": -2.41, "Au": -2.88}  # eV/atom, patched model (DFT-PBE bulk: -3.5, -2.5, -3.0)
+    with open(ROOT / "data" / "MaterialDict.pkl", "rb") as f:
+        data = {k.decode("utf8"): v for k, v in pickle.load(f, encoding="bytes").items()}
+    for element, reference in expected.items():
+        slab = fcc111(element, size=(2, 2, 4), a=data[element][b"qLattConst-PBE"])
+        slab.center(vacuum=7.5, axis=2)
+        ech = T.CohesiveEnergy(image=slab).predict()
+        np.testing.assert_allclose(ech.mean(), reference, atol=3e-2)
 
 
 def test_band_moments(structures):
