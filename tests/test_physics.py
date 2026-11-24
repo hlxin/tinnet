@@ -162,6 +162,28 @@ def test_cohesion_parameters_sum_to_energy():
     assert torch.allclose(params[:, 0], constants["promotion_energy"])
 
 
+def test_cohesion_terms_match_closed_form_and_units():
+    """E_s = c [n_s/(beta V)]^(2/3) with c in eV A^2; E_d = -alpha W/20 n_d (10 - n_d)."""
+    physics = CohesionModel()
+    # target state variables: [alpha, beta, n_s, n_d, width]; invert the softplus for the latent
+    alpha, beta, ns, nd, width = 1.5, 0.8, 1.2, 8.0, 6.0
+    inverse_softplus = lambda y: math.log(math.expm1(y))  # noqa: E731
+    latent = torch.tensor([[-3.0] + [inverse_softplus(v) for v in (alpha, beta, ns, nd, width)]],
+                          dtype=torch.float64)
+    volume = 16.0  # Angstrom^3, the unit of the tabulated Wigner-Seitz volumes
+    constants = {"promotion_energy": torch.tensor([0.5], dtype=torch.float64),
+                 "wigner_seitz_volume": torch.tensor([volume], dtype=torch.float64)}
+    energy, params = physics(latent, constants)
+    c = 0.3 * 7.619964231070681 * (3 * math.pi ** 2) ** (2 / 3)  # (3/10)(hbar^2/m), hbar^2/m = 7.62 eV A^2
+    expected_s = c * (ns / (beta * volume)) ** (2 / 3)
+    expected_d = -alpha * width / 20 * nd * (10 - nd)
+    assert params[0, 2].item() == pytest.approx(expected_s, rel=1e-3)
+    assert params[0, 3].item() == pytest.approx(expected_d, rel=1e-9)
+    # a free-electron band energy of a metal is a few eV per atom, not ~1e-20 eV
+    assert 1.0 < params[0, 2].item() < 10.0
+    assert energy.item() == pytest.approx(0.5 - 3.0 + expected_s + expected_d, rel=1e-3)
+
+
 # ----------------------------------------------------------------------
 # Rectangular band
 # ----------------------------------------------------------------------

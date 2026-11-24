@@ -101,6 +101,22 @@ pytest                    # fast unit tests of the physics package (no checkpoin
 pytest -m integration     # notebook examples against data/pretrained (a few minutes)
 ```
 
+## Cohesion-model correction (November 2026)
+
+`physics/cohesion.py` now evaluates the cohesive-energy expression the April 2026
+checkpoints in `data/pretrained/cohesive_energy` were trained with,
+
+    E_coh = E_prom + E_ren + c [n_s / (beta V_ws)]^(2/3) - alpha (W/20) n_d (10 - n_d),
+
+with `c = (3 hbar^2 / 10 m)(3 pi^2)^(2/3) = 21.88 eV A^2` and `V_ws` in A^3. Before this
+change the prefactor was given in eV m^2 while the tabulated volumes are in A^3, so the
+conduction-band term evaluated to ~1e-20 eV, and the two correction factors were applied
+in the roles of the older (August 2025) checkpoints. `CohesiveEnergy.predict` therefore
+returned, e.g., -5.65 eV/atom for a Cu-doped Ag(111) slab; it now returns -2.43 eV/atom,
+and pure Cu/Ag/Au slabs give -3.31/-2.41/-2.88 eV/atom. The stored outputs of "Model 4:
+cohesive energy" in `tutorials/tinnet.ipynb` and `tutorials/shap.png` predate this
+correction and need to be regenerated.
+
 ## Refactor notes (September 2026)
 
 - Added the `physics/` package, `gnn.py`, `descriptors.py`, and `training.py`.

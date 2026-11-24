@@ -7,9 +7,17 @@ Per atom the cohesive energy is decomposed as
     E_{coh} = E_{prom} + E_{renorm} + E_{s} + E_{d},
 
 with the tabulated promotion energy :math:`E_{prom}`, a learned
-renormalization term, a free-electron-like sp term
-:math:`E_s = c\\,V_{ws}^{-2/3}\\,\\alpha\\,n_s^{2/3}` and the rectangular-band d
-term :math:`E_d = \\beta\\,W/20\\,n_d (n_d - 10)`.
+renormalization term, the free-electron-like conduction-band term
+:math:`E_s = c\\,[n_s / (\\beta V_{ws})]^{2/3}` and the rectangular-band d
+term :math:`E_d = -\\alpha\\,W/20\\,n_d (10 - n_d)`.
+
+:math:`c = (3\\hbar^2/10m)(3\\pi^2)^{2/3} = 21.88` eV Angstrom^2, so the
+Wigner-Seitz volumes must be given in Angstrom^3 (the unit of the tabulated
+``wigner_seitz_volume`` constants).  :math:`\\beta` rescales the tabulated
+volume to an effective local volume and :math:`\\alpha` corrects the
+rectangular-band estimate.  This is the parameterization the pretrained
+checkpoints in ``data/pretrained/cohesive_energy`` (April 2026) were trained
+with.
 """
 
 from __future__ import annotations
@@ -21,7 +29,10 @@ import torch.nn.functional as F
 
 from .base import PhysicsModel, register_physics
 
-FREE_ELECTRON_PREFACTOR = 2.1880420859580444e-19
+# (3 hbar^2 / 10 m) (3 pi^2)^(2/3) in eV * Angstrom^2.  The value used before,
+# 2.188e-19, is the same constant in eV * m^2; combined with volumes in
+# Angstrom^3 it made the conduction-band term ~1e-20 eV.
+FREE_ELECTRON_PREFACTOR = 21.880420859580444
 
 
 @register_physics("cohesion")
@@ -29,7 +40,9 @@ class CohesionModel(PhysicsModel):
     """Cohesive-energy theory module evaluated per atom.
 
     Latent layout (6 per atom): ``[e_ren, alpha, beta, n_s, n_d, width]`` where
-    all but ``e_ren`` are made positive by a softplus.
+    all but ``e_ren`` are made positive by a softplus.  ``alpha`` multiplies the
+    rectangular-band d term and ``beta`` scales the Wigner-Seitz volume in the
+    conduction-band term.
     """
 
     n_latent = 6
@@ -50,9 +63,8 @@ class CohesionModel(PhysicsModel):
         vws = torch.as_tensor(constants["wigner_seitz_volume"], dtype=latent.dtype, device=latent.device).reshape(batch)
         s = self.state_variables(latent)
 
-        conduction_term = FREE_ELECTRON_PREFACTOR * (1.0 / vws) ** (2.0 / 3.0)
-        conduction_energy = conduction_term * s["alpha"] * s["ns"] ** (2.0 / 3.0)
-        d_band_energy = s["beta"] * s["width"] / 20.0 * s["nd"] * (s["nd"] - 10.0)
+        conduction_energy = FREE_ELECTRON_PREFACTOR * (s["ns"] / (s["beta"] * vws)) ** (2.0 / 3.0)
+        d_band_energy = s["alpha"] * s["width"] / 20.0 * s["nd"] * (s["nd"] - 10.0)
         return torch.stack((pe, s["e_ren"], conduction_energy, d_band_energy), dim=1)
 
     def property_from_parameters(self, params: torch.Tensor) -> torch.Tensor:
